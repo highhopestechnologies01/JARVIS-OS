@@ -10,7 +10,7 @@ export async function InfraPanel() {
   let error = false;
 
   try {
-    health = await hermesApi<typeof health>("/api/v1/health/ready");
+    health = await hermesApi<{ status: string; checks: ServiceCheck }>("/api/v1/health/ready");
   } catch {
     error = true;
   }

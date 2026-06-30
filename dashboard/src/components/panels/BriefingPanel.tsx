@@ -1,11 +1,13 @@
 import { hermesApi } from "@/lib/api";
 
+type Briefing = { date: string; content: string; summary?: string; status: string };
+
 export async function BriefingPanel() {
-  let briefing: { date: string; content: string; summary?: string; status: string } | null = null;
+  let briefing: Briefing | null = null;
   let error = false;
 
   try {
-    briefing = await hermesApi<typeof briefing>("/api/v1/briefings/today");
+    briefing = await hermesApi<Briefing>("/api/v1/briefings/today");
   } catch {
     error = true;
   }
