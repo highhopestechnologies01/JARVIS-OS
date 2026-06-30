@@ -9,18 +9,19 @@ export function VoicePanel() {
   const [transcript, setTranscript] = useState("");
   const [response, setResponse] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recognitionRef = useRef<any>(null);
 
   const HERMES_URL = process.env.NEXT_PUBLIC_HERMES_URL ?? "http://localhost:8001";
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const SpeechRecognition =
-      (window as Window & { SpeechRecognition?: typeof globalThis.SpeechRecognition }).SpeechRecognition ||
-      (window as Window & { webkitSpeechRecognition?: typeof globalThis.SpeechRecognition }).webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SpeechRecognitionAPI: any =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognitionAPI) return;
 
-    const recognition = new SpeechRecognition();
+    const recognition = new SpeechRecognitionAPI();
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.lang = "en-US";
