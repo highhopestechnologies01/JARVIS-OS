@@ -78,11 +78,12 @@ async def infrastructure_health_check():
     log.info("jobs.health_check.start")
 
     # Use Docker internal hostnames — Hermes checks itself via localhost
+    # n8n container is named jarvis-n8n on jarvis-net
     services = {
         "hermes":     "http://localhost:8000/api/v1/health/ready",
-        "n8n":        "http://n8n:5678/healthz",
-        "grafana":    "http://grafana:3000/api/health",
-        "prometheus": "http://prometheus:9090/-/healthy",
+        "n8n":        "http://jarvis-n8n:5678/healthz",
+        "grafana":    "http://jarvis-grafana:3000/api/health",
+        "prometheus": "http://jarvis-prometheus:9090/-/healthy",
     }
 
     statuses: dict[str, str] = {}

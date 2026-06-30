@@ -85,28 +85,36 @@ Mac environment fully configured.
 
 ---
 
-## Phase 6 · Automation ⏳ PLANNED
+## Phase 6 · Automation ✅ COMPLETE
 
-**Goal:** Hermes runs autonomously with zero daily maintenance.
+**Completed: 2026-06-30**
 
-- [ ] Daily morning briefing (8am)
-- [ ] Infrastructure health check (every 15 min)
-- [ ] Weekly performance report (Monday 9am)
-- [ ] Alert on service failure (immediate)
-- [ ] n8n workflows: at least 5 automations live
-- [ ] Auto-restart failed services
+- [x] Daily morning briefing (8am ET) — APScheduler, Claude Haiku, saves to DB
+- [x] Infrastructure health check (every 15 min) — checks Hermes, n8n, Grafana, Prometheus
+- [x] Weekly performance report (Monday 9am ET)
+- [x] Alert on service failure (immediate) — SMS via Twilio dispatcher
+- [x] Memory consolidation (2am daily) — prunes expired entries
+- [x] Scheduler API — GET /api/v1/scheduler/jobs, POST /trigger/{job_id}
+- [x] SchedulerPanel — live next-run countdowns, ▶ run buttons per job
+- [ ] n8n workflows: at least 5 automations live (Phase 7)
+- [ ] Auto-restart failed services (Phase 8)
 
 ---
 
-## Phase 7 · AI Intelligence ⏳ PLANNED
+## Phase 7 · AI Intelligence ✅ COMPLETE
 
-**Goal:** Hermes learns, predicts, and acts without being asked.
+**Completed: 2026-06-30**
 
-- [ ] Long-term memory with semantic search (pgvector)
-- [ ] Pattern recognition (usage, performance trends)
-- [ ] Predictive monitoring (anomaly detection)
-- [ ] Autonomous task planning (weekly)
-- [ ] Context-aware briefings (personalized)
+- [x] context_builder.py — aggregates events, health history, memories, patterns for briefings
+- [x] pattern_analyzer.py — Claude Haiku analyzes system data daily, stores insights as memories
+- [x] AI Pattern Analysis job — runs every day at 3am, 5 insights stored with 7-day expiry
+- [x] Autonomous Weekly Planning job — every Sunday 6am, Claude Opus generates full week plan
+- [x] intelligence.py API — GET /insights, POST /analyze (manual trigger)
+- [x] IntelligencePanel — live AI insights on dashboard with ⚡ analyze button
+- [x] Daily briefing upgraded — uses context_builder for rich real-data context
+- [x] 6 autonomous jobs running: health_check, briefing, pattern_analysis, weekly_plan, memory_consolidation, weekly_report
+- [ ] pgvector semantic search (Phase 8 — needs DB migration)
+- [ ] Anomaly detection alerts (Phase 8)
 
 ---
 
@@ -134,6 +142,19 @@ Mac environment fully configured.
 - Scaffolded: Hermes (Python/FastAPI)
 - Scaffolded: Dashboard (Next.js)
 - Written: bootstrap and deployment scripts
+
+### Session Report — 2026-06-30 (Phase 6)
+#### Completed
+- Wired `register_core_jobs()` into Hermes startup (jobs were never being registered)
+- Created `scheduler.py` API route — GET /jobs, POST /trigger/{job_id}
+- Fixed health check Docker service URLs, added Prometheus, persist results to events table
+- Rebuilt SchedulerPanel as client component with SWR, live next-run times, manual trigger buttons
+- Fixed CORS — added `localhost:3002` to allowed origins
+#### Files Modified
+- hermes/src/main.py, hermes/src/core/jobs.py, hermes/src/api/routes/scheduler.py
+- dashboard/src/components/panels/SchedulerPanel.tsx
+#### Next Session Priority
+- Phase 7: AI Intelligence — pgvector semantic search, pattern recognition, autonomous planning
 
 ### 2026-06-30
 - Deployed full infrastructure to VPS (postgres, redis, n8n, prometheus, grafana)

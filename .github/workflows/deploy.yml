@@ -1,0 +1,127 @@
+name: Deploy JARVIS OS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get changed files
+        id: changes
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only HEAD)
+          echo "files=$CHANGED" >> $GITHUB_OUTPUT
+
+          # Detect what needs deploying
+          if echo "$CHANGED" | grep -q "^hermes/"; then
+            echo "deploy_hermes=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_hermes=false" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED" | grep -q "^dashboard/"; then
+            echo "deploy_dashboard=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_dashboard=false" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED" | grep -q "^infrastructure/"; then
+            echo "deploy_infra=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_infra=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/jarvis_vps
+          chmod 600 ~/.ssh/jarvis_vps
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pull latest code on VPS
+        run: |
+          ssh -i ~/.ssh/jarvis_vps root@${{ secrets.VPS_HOST }} \
+            "cd /opt/jarvis-repo && git pull origin main"
+
+      - name: Deploy Hermes (hot-patch)
+        if: steps.changes.outputs.deploy_hermes == 'true'
+        run: |
+          ssh -i ~/.ssh/jarvis_vps root@${{ secrets.VPS_HOST }} '
+            cd /opt/jarvis-repo
+
+            # Copy all changed Python source files
+            find hermes/src -name "*.py" | while read f; do
+              dest="/app/${f#hermes/}"
+              dir=$(dirname "$dest")
+              docker exec jarvis-hermes mkdir -p "$dir" 2>/dev/null || true
+              docker cp "$f" "jarvis-hermes:$dest"
+            done
+
+            # Restart Hermes
+            docker restart jarvis-hermes
+            sleep 4
+
+            # Verify
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8001/api/v1/health/ready)
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ Hermes healthy (HTTP $STATUS)"
+            else
+              echo "✗ Hermes health check failed (HTTP $STATUS)"
+              exit 1
+            fi
+          '
+
+      - name: Deploy Dashboard (rebuild)
+        if: steps.changes.outputs.deploy_dashboard == 'true'
+        run: |
+          ssh -i ~/.ssh/jarvis_vps root@${{ secrets.VPS_HOST }} '
+            cd /opt/jarvis-repo
+
+            echo "Building dashboard..."
+            docker build -t jarvis-dashboard ./dashboard
+
+            echo "Restarting dashboard container..."
+            docker stop jarvis-dashboard 2>/dev/null || true
+            docker rm jarvis-dashboard 2>/dev/null || true
+            docker run -d \
+              --name jarvis-dashboard \
+              --restart unless-stopped \
+              --network jarvis-net \
+              -e NEXT_PUBLIC_HERMES_URL=http://jarvis-hermes:8000 \
+              -e NODE_ENV=production \
+              -p 0.0.0.0:3002:3000 \
+              jarvis-dashboard
+
+            sleep 5
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3002)
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ Dashboard healthy (HTTP $STATUS)"
+            else
+              echo "✗ Dashboard health check failed (HTTP $STATUS)"
+              exit 1
+            fi
+          '
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Hermes | ${{ steps.changes.outputs.deploy_hermes }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard | ${{ steps.changes.outputs.deploy_dashboard }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Changed files:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.changes.outputs.files }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
