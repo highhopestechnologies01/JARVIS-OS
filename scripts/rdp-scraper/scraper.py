@@ -292,49 +292,100 @@ JS_INSTALL_OVERRIDE = r"""
 
 JS_TRIGGER_REFRESH = r"""
 (function() {
-    // Try to click a refresh/reload button in Ads Manager
-    var selectors = [
-        '[aria-label="Reload"]',
-        '[aria-label="Refresh"]',
-        '[aria-label="refresh"]',
-        '[data-testid*="refresh"]',
-        '[data-testid*="reload"]',
-    ];
-    for (var sel of selectors) {
-        var btn = document.querySelector(sel);
-        if (btn) { btn.click(); return 'clicked:' + sel; }
-    }
+    var results = [];
 
-    // Try toggling a date range (forces data reload)
-    var dateBtn = document.querySelector('[data-testid="date-range-selector"]') ||
-                  document.querySelector('[aria-label*="Date"]') ||
-                  document.querySelector('[aria-label*="date"]');
-    if (dateBtn) { dateBtn.click(); return 'clicked:date'; }
+    // 1. Click "Campaigns" nav link — triggers full campaign data reload
+    try {
+        var links = Array.from(document.querySelectorAll('a, [role="tab"], [role="menuitem"], [role="link"]'));
+        var campaignLink = links.find(function(l) {
+            var txt = (l.textContent || l.innerText || '').trim();
+            return txt === 'Campaigns' || l.getAttribute('data-key') === 'campaigns';
+        });
+        if (campaignLink) { campaignLink.click(); results.push('clicked:campaigns'); }
+    } catch(e) {}
 
-    // Scroll to trigger any lazy-load
-    window.scrollBy(0, 50);
-    window.scrollBy(0, -50);
-    return 'scrolled';
+    // 2. Click "Today" preset in date selector
+    try {
+        var todayBtn = Array.from(document.querySelectorAll('[role="option"], [role="button"], button')).find(function(b) {
+            var txt = (b.textContent || '').trim();
+            return txt === 'Today' || txt === 'Last 7 days';
+        });
+        if (todayBtn) { todayBtn.click(); results.push('clicked:today'); }
+    } catch(e) {}
+
+    // 3. Click date range button to open picker (triggers data load on close)
+    try {
+        var dateBtn = document.querySelector('[data-testid="date-range-selector"]') ||
+                      document.querySelector('[aria-label*="date range"]') ||
+                      document.querySelector('[aria-label*="Date range"]');
+        if (dateBtn) { dateBtn.click(); results.push('clicked:date_range'); }
+    } catch(e) {}
+
+    // 4. Click any visible filter or column header to force table reload
+    try {
+        var colHeader = document.querySelector('[role="columnheader"]');
+        if (colHeader) { colHeader.click(); results.push('clicked:column'); }
+    } catch(e) {}
+
+    // 5. Scroll to trigger lazy-load
+    window.scrollBy(0, 100);
+    window.scrollBy(0, -100);
+    results.push('scrolled');
+
+    return results.join(',') || 'no_trigger';
 })()
 """
 
 # ── Meta Marketing API ────────────────────────────────────────────────────────
 
-async def fetch_via_meta_api(token: str) -> list[dict]:
+async def fetch_via_meta_api(token: str, known_account_ids: list[str] = None) -> list[dict]:
     results = []
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+
+            # ── Validate token with /me ────────────────────────────────────
+            me_r = await client.get(
+                "https://graph.facebook.com/v19.0/me",
+                params={"access_token": token, "fields": "id,name"},
+            )
+            me_data = me_r.json()
+            if "error" in me_data:
+                print(f"    Token validation failed: {me_data['error'].get('message','?')} (code {me_data['error'].get('code','?')})")
+                print(f"    Token is invalid or wrong type — will try account-direct call")
+            else:
+                print(f"    Token valid — user: {me_data.get('name','?')} ({me_data.get('id','?')})")
+
+            # ── Try /me/adaccounts ─────────────────────────────────────────
             r = await client.get(
                 "https://graph.facebook.com/v19.0/me/adaccounts",
                 params={"access_token": token, "fields": "id,name,account_status", "limit": 100},
             )
-            if r.status_code != 200:
-                print(f"    Meta API error: {r.status_code} {r.text[:200]}")
-                return []
-            accounts = r.json().get("data", [])
-            if not accounts:
-                print("    Meta API: no ad accounts returned")
-                return []
+            rj = r.json()
+            accounts = rj.get("data", [])
+
+            if "error" in rj or not accounts:
+                err = rj.get("error", {})
+                print(f"    /me/adaccounts failed: {err.get('message','no data')} (code {err.get('code','?')})")
+
+                # ── Try account-direct endpoint using known account IDs ────
+                if known_account_ids:
+                    print(f"    Trying direct account call for: {known_account_ids}")
+                    for aid_raw in known_account_ids:
+                        aid = f"act_{aid_raw}" if not aid_raw.startswith("act_") else aid_raw
+                        # Test if token works for this specific account
+                        acc_r = await client.get(
+                            f"https://graph.facebook.com/v19.0/{aid}",
+                            params={"access_token": token, "fields": "id,name,account_status"},
+                        )
+                        acc_data = acc_r.json()
+                        if "error" not in acc_data:
+                            accounts = [{"id": aid, "name": acc_data.get("name", aid)}]
+                            print(f"    Direct account access OK: {accounts[0]['name']}")
+                        else:
+                            print(f"    Direct account {aid} also failed: {acc_data['error'].get('message','?')}")
+
+                if not accounts:
+                    return []
 
             print(f"    Meta API: {len(accounts)} ad accounts found")
             for account in accounts:
@@ -507,6 +558,11 @@ async def scrape_profile(profile: dict) -> dict:
         async with websockets.connect(ws_url, ping_interval=None, open_timeout=15, close_timeout=5) as ws:
             await cdp_send(ws, "Runtime.enable")
 
+            # Extract account ID from URL (used for direct API fallback)
+            account_ids_from_url = re.findall(r'act[_=](\d+)', current_url)
+            if account_ids_from_url:
+                print(f"  Account ID from URL: {account_ids_from_url}")
+
             # ── Strategy 1: Extract token from page memory (NO reload) ────
             print("  Searching page memory for access token...")
             token = await cdp_eval(ws, JS_EXTRACT_TOKEN)
@@ -514,15 +570,17 @@ async def scrape_profile(profile: dict) -> dict:
                 print(f"  ✓ Token found in page memory ({len(token)} chars)")
             else:
                 token = None
-                print("  Token not in page memory — installing fetch override...")
+
+            if not token:
+                print("  Token not in page memory — installing fetch override + triggering UI...")
 
                 # ── Strategy 2: Install override + trigger UI refresh ─────
                 await cdp_eval(ws, JS_INSTALL_OVERRIDE)
                 trigger_result = await cdp_eval(ws, JS_TRIGGER_REFRESH)
                 print(f"  Trigger result: {trigger_result}")
 
-                # Wait for any triggered API calls
-                deadline = asyncio.get_event_loop().time() + 15.0
+                # Wait up to 20s for triggered API calls to fire
+                deadline = asyncio.get_event_loop().time() + 20.0
                 while asyncio.get_event_loop().time() < deadline:
                     await asyncio.sleep(1.0)
                     captured = await cdp_eval(ws, "window.__jarvis_captured_token || ''")
@@ -578,7 +636,7 @@ async def scrape_profile(profile: dict) -> dict:
 
             # ── Use token with Meta Marketing API ─────────────────────────
             if token:
-                api_data = await fetch_via_meta_api(token)
+                api_data = await fetch_via_meta_api(token, known_account_ids=account_ids_from_url)
                 if api_data:
                     all_campaigns = []
                     total_spend = total_impr = total_clicks = active = 0
