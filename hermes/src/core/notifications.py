@@ -1,7 +1,7 @@
 """
 Notification Dispatcher — sends alerts via multiple channels.
 
-Channels: SMS (Twilio), Email (SMTP), Dashboard (in-memory feed)
+Channels: Telegram (primary), SMS (Twilio), Email (SMTP), Dashboard (in-memory feed)
 """
 
 import smtplib
@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import httpx
 import structlog
 from twilio.rest import Client as TwilioClient
 
@@ -16,9 +17,42 @@ from src.config import settings
 
 log = structlog.get_logger()
 
+TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+
 
 class NotificationDispatcher:
     """Sends notifications via configured channels."""
+
+    async def send_telegram(
+        self,
+        message: str,
+        chat_id: str | None = None,
+        parse_mode: str = "HTML",
+    ) -> bool:
+        """Send message via Telegram Bot API."""
+        if not settings.telegram_bot_token:
+            log.warning("notifications.telegram.not_configured")
+            return False
+
+        cid = chat_id or settings.telegram_chat_id
+        if not cid:
+            log.error("notifications.telegram.no_chat_id")
+            return False
+
+        url = TELEGRAM_API.format(token=settings.telegram_bot_token)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json={
+                    "chat_id": cid,
+                    "text": message,
+                    "parse_mode": parse_mode,
+                })
+                resp.raise_for_status()
+            log.info("notifications.telegram.sent", chat_id=cid)
+            return True
+        except Exception as e:
+            log.error("notifications.telegram.failed", error=str(e), chat_id=cid)
+            return False
 
     async def send_sms(
         self,
@@ -88,6 +122,12 @@ class NotificationDispatcher:
     async def send_briefing(self, briefing_content: str, date_str: str) -> dict[str, bool]:
         """Deliver a briefing via all configured channels."""
         results = {}
+
+        # Telegram: full briefing (primary channel)
+        tg_header = f"<b>🤖 JARVIS Briefing — {date_str}</b>\n\n"
+        # Telegram messages max 4096 chars
+        tg_body = briefing_content[:3900] + ("..." if len(briefing_content) > 3900 else "")
+        results["telegram"] = await self.send_telegram(tg_header + tg_body)
 
         # SMS: send summary (first 160 chars)
         sms_preview = f"JARVIS Briefing {date_str}: " + briefing_content[:120] + "..."

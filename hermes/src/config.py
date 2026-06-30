@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     notification_email: str = ""
 
+    # Telegram
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     # Notion
     notion_api_key: str = ""
     notion_dashboard_page_id: str = ""

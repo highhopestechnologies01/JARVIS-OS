@@ -126,8 +126,10 @@ async def infrastructure_health_check():
 
     if failures:
         from src.core.notifications import dispatcher
-        alert = "⚠️ JARVIS Health Alert:\n" + "\n".join(f"• {f}" for f in failures)
-        await dispatcher.send_sms(alert)
+        alert_html = "⚠️ <b>JARVIS Health Alert</b>\n" + "\n".join(f"• {f}" for f in failures)
+        alert_plain = "⚠️ JARVIS Health Alert:\n" + "\n".join(f"• {f}" for f in failures)
+        await dispatcher.send_telegram(alert_html)
+        await dispatcher.send_sms(alert_plain)
         log.warning("jobs.health_check.failures", failures=failures)
 
         # POST to n8n health alert workflow (non-blocking — failure here is OK)
