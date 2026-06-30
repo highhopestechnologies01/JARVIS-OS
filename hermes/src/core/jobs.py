@@ -79,21 +79,41 @@ async def infrastructure_health_check():
 
     log.info("jobs.health_check.start")
 
+    # Use Docker internal hostnames — Hermes checks itself via localhost
     services = {
-        "hermes": "http://localhost:8000/health",
-        "n8n": "http://n8n:5678/healthz",
-        "grafana": "http://grafana:3000/api/health",
+        "hermes":     "http://localhost:8000/api/v1/health/ready",
+        "n8n":        "http://n8n:5678/healthz",
+        "grafana":    "http://grafana:3000/api/health",
+        "prometheus": "http://prometheus:9090/-/healthy",
     }
 
-    failures = []
+    statuses: dict[str, str] = {}
+    failures: list[str] = []
+
     async with httpx.AsyncClient(timeout=5.0) as client:
         for name, url in services.items():
             try:
                 resp = await client.get(url)
                 if resp.status_code >= 400:
                     failures.append(f"{name}: HTTP {resp.status_code}")
+                    statuses[name] = "down"
+                else:
+                    statuses[name] = "ok"
             except Exception as e:
-                failures.append(f"{name}: {e}")
+                failures.append(f"{name}: unreachable")
+                statuses[name] = "down"
+                log.warning("jobs.health_check.service_error", service=name, error=str(e))
+
+    # Persist result to database
+    from src.db.connection import AsyncSessionLocal
+    from src.db.models import Event
+    async with AsyncSessionLocal() as db:
+        db.add(Event(
+            type="health_check.completed",
+            source="infrastructure_health_check_job",
+            payload={"statuses": statuses, "failures": failures},
+        ))
+        await db.commit()
 
     if failures:
         from src.core.notifications import dispatcher

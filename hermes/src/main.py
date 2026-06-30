@@ -13,8 +13,8 @@ from prometheus_client import make_asgi_app
 
 from src.config import settings
 from src.db.connection import init_db, close_db
-from src.core.scheduler import scheduler
-from src.api.routes import health, briefings, memory, tasks, notifications, voice
+from src.core.scheduler import scheduler, register_core_jobs
+from src.api.routes import health, briefings, memory, tasks, notifications, voice, scheduler as scheduler_routes
 
 # Configure structured logging
 structlog.configure(
@@ -34,7 +34,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     log.info("hermes.db.ready")
 
-    # Start scheduler
+    # Register and start scheduler
+    register_core_jobs()
     scheduler.start()
     log.info("hermes.scheduler.started")
 
@@ -77,3 +78,4 @@ app.include_router(memory.router, prefix="/api/v1/memory", tags=["memory"])
 app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
 app.include_router(notifications.router, prefix="/api/v1/notifications", tags=["notifications"])
 app.include_router(voice.router, prefix="/api/v1/voice", tags=["voice"])
+app.include_router(scheduler_routes.router, prefix="/api/v1/scheduler", tags=["scheduler"])
