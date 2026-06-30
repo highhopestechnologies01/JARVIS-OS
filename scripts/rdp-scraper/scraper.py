@@ -312,9 +312,34 @@ async def scrape_profile(profile: dict) -> dict:
 
         opened_new = False
         if not ads_tab:
-            print(f"[{name}] No Ads Manager tab found — opening new tab")
-            ads_tab = await cdp_new_tab(debug_port, "about:blank")
-            opened_new = True
+            print(f"[{name}] No Ads Manager tab — looking for blank tab to reuse")
+            # 1) reuse existing blank/newtab tab
+            for t in tabs:
+                u = t.get("url", "")
+                if u in ("about:blank", "chrome://newtab/", "") or "newtab" in u:
+                    ads_tab = t
+                    opened_new = True
+                    break
+
+            # 2) try /json/new (some Chrome builds support it)
+            if not ads_tab:
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as _c:
+                        _r = await _c.get(f"http://localhost:{debug_port}/json/new")
+                        if _r.text.strip():
+                            ads_tab = _r.json()
+                            opened_new = True
+                except Exception:
+                    pass
+
+            # 3) fall back to first tab and navigate it
+            if not ads_tab and tabs:
+                ads_tab = tabs[0]
+                opened_new = False  # don't close — it was pre-existing
+
+        if not ads_tab:
+            result["error"] = "No usable tab found"
+            return result
 
         ws_url = ads_tab.get("webSocketDebuggerUrl")
         if not ws_url:
