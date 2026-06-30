@@ -137,6 +137,19 @@ Mac environment fully configured.
 
 ---
 
+## Telegram Notifications ✅ COMPLETE
+
+**Completed: 2026-06-30**
+
+- [x] `send_telegram()` in NotificationDispatcher — httpx, no new deps
+- [x] Health alerts fire to Telegram first, SMS as fallback
+- [x] Daily briefings delivered via Telegram (full content, HTML formatted)
+- [x] Bot token + chat ID in root `.env`, loaded via Pydantic settings
+- [x] Hermes → Telegram internal connection confirmed from Docker container
+- [x] n8n jarvis-net watchdog cron — `* * * * *` reconnects on restart
+
+---
+
 ## Coolify Integration ✅ COMPLETE
 
 **Completed: 2026-06-30**
