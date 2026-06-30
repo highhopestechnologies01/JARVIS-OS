@@ -68,15 +68,20 @@ Mac environment fully configured.
 
 ---
 
-## Phase 5 · Voice ⏳ PLANNED
+## Phase 5 · Voice ✅ COMPLETE
 
-**Goal:** Speak a command → Hermes acts → hears the response.
+**Completed: 2026-06-30**
 
-- [ ] Speech-to-text pipeline (Whisper or Deepgram)
-- [ ] Voice command router in Hermes
-- [ ] Text-to-speech response (ElevenLabs or OpenAI TTS)
-- [ ] Voice panel in Dashboard
-- [ ] Wake word detection (optional)
+- [x] Voice command endpoint in Hermes (`POST /api/v1/voice/command`)
+- [x] Claude Haiku (claude-haiku-4-5-20251001) for fast spoken responses
+- [x] JARVIS persona system prompt (chief-of-staff tone)
+- [x] VoicePanel client component in Dashboard (Web Speech API)
+- [x] Browser-native STT (SpeechRecognition) + TTS (SpeechSynthesis)
+- [x] States: idle → listening → processing → speaking → error
+- [x] Mic button with animated pulse per state
+- [x] Full dark theme with Tailwind CSS (postcss.config.js fix deployed)
+- [ ] Wake word detection (Phase 7)
+- [ ] ElevenLabs TTS for higher-quality voice (Phase 7)
 
 ---
 
