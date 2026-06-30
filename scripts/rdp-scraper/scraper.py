@@ -38,14 +38,13 @@ def load_config() -> dict:
 
 # ── Ads Power API ─────────────────────────────────────────────────────────────
 
-async def scan_chrome_ports(port_start: int = 50000, port_end: int = 56000) -> list[dict]:
+async def scan_chrome_ports(port_start: int = 52000, port_end: int = 54500) -> list[dict]:
     """
     Scan port range for active Chrome CDP endpoints.
-    Returns list of {user_id, name, debug_port} for every live Chrome instance found.
-    This works even when Ads Power API misses profiles.
+    Ads Power typically uses 52000-54500. Timeout 0.3s — local ports respond instantly.
     """
     found = []
-    async with httpx.AsyncClient(timeout=1.5) as client:
+    async with httpx.AsyncClient(timeout=0.3) as client:
         async def check_port(port: int):
             try:
                 r = await client.get(f"http://localhost:{port}/json/list")
