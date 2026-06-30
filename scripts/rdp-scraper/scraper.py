@@ -3,15 +3,18 @@ JARVIS Meta Ads Scraper — runs on RDP machines (Windows).
 
 Strategy:
   1. Query Ads Power local API for active browser profiles
-  2. For each profile: get CDP debug port, find Ads Manager tab
-  3. Use raw CDP websockets — enable Network domain, reload page
-  4. BYPASS SERVICE WORKER so graph.facebook.com requests are visible
-  5. Intercept graph.facebook.com requests to capture access_token
-  6. JS injection backup: override fetch/XHR in page context
-  7. Call Meta Marketing API with captured token for clean data
-  8. Fallback: DOM scrape with broad selectors
-  9. POST results to Hermes
+  2. For each profile: get CDP debug port, find any authenticated Facebook tab
+  3. Connect via raw CDP websockets
+  4. Extract access_token from page JS memory (NO reload, NO navigation)
+     - Search <script> tags for EAA... token pattern
+     - Try Facebook's require('AccessToken') module
+     - Search window globals and JSON structures
+  5. If no memory token: inject fetch override, trigger UI refresh, wait
+  6. Call Meta Marketing API with captured token
+  7. Fallback: DOM scrape the current page
+  8. POST results to Hermes
 
+NO RELOADS. NO NAVIGATION. Working with the page as-is preserves auth.
 Run every 5 minutes via Windows Task Scheduler.
 Configure via config.json in this directory.
 """
@@ -38,49 +41,12 @@ def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         return json.load(f)
 
-# ── Ads Power API ─────────────────────────────────────────────────────────────
-
-async def scan_chrome_ports(port_start: int = 52000, port_end: int = 54500) -> list[dict]:
-    """
-    Scan port range for active Chrome CDP endpoints.
-    Ads Power typically uses 52000-54500. Timeout 0.3s — local ports respond instantly.
-    """
-    found = []
-    async with httpx.AsyncClient(timeout=0.3) as client:
-        async def check_port(port: int):
-            try:
-                r = await client.get(f"http://localhost:{port}/json/list")
-                if r.status_code == 200:
-                    tabs = r.json()
-                    if isinstance(tabs, list):
-                        fb_tabs = [t for t in tabs if "facebook.com" in t.get("url", "")]
-                        return {"user_id": f"port_{port}", "name": f"port_{port}",
-                                "debug_port": str(port), "tabs": tabs, "fb_tabs": len(fb_tabs)}
-            except Exception:
-                pass
-            return None
-
-        tasks = [check_port(p) for p in range(port_start, port_end)]
-        results = await asyncio.gather(*tasks)
-        for r in results:
-            if r:
-                found.append(r)
-
-    found.sort(key=lambda x: x.get("fb_tabs", 0), reverse=True)
-    print(f"  Port scan found {len(found)} Chrome instances: {[x['debug_port'] for x in found]}")
-    return found
+# ── Ads Power / Port discovery ────────────────────────────────────────────────
 
 async def get_active_profiles(adspower_url: str, fixed_ports: list[int] = None) -> list[dict]:
-    """
-    Get active profiles.
-    1. Check fixed_ports from config (explicit, fast, reliable)
-    2. Ads Power API
-    3. Port scan fallback
-    """
     active = []
     known_ports: set[str] = set()
 
-    # ── Fixed ports (highest priority — user-specified from netstat) ──────
     if fixed_ports:
         print(f"Checking fixed ports: {fixed_ports}")
         async with httpx.AsyncClient(timeout=2.0) as client:
@@ -101,7 +67,6 @@ async def get_active_profiles(adspower_url: str, fixed_ports: list[int] = None) 
                 except Exception as e:
                     print(f"  port {port}: unreachable ({e})")
 
-    # ── Ads Power API ─────────────────────────────────────────────────────
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{adspower_url}/api/v1/user/list",
@@ -126,21 +91,29 @@ async def get_active_profiles(adspower_url: str, fixed_ports: list[int] = None) 
     except Exception as e:
         print(f"[WARN] Ads Power API error: {e}")
 
-    # ── Port scan fallback (if nothing found yet) ─────────────────────────
     if not active:
-        print("Scanning ports for active Chrome instances...")
-        port_results = await scan_chrome_ports(50000, 58000)
-        for pr in port_results:
-            if pr["debug_port"] not in known_ports:
-                active.append({
-                    "user_id": pr["user_id"],
-                    "name": pr["name"],
-                    "debug_port": pr["debug_port"],
-                })
+        print("Scanning ports 50000-58000 for Chrome instances...")
+        async with httpx.AsyncClient(timeout=0.4) as client:
+            async def check(port):
+                try:
+                    r = await client.get(f"http://localhost:{port}/json/list")
+                    if r.status_code == 200:
+                        tabs = r.json()
+                        fb = [t for t in tabs if "facebook.com" in t.get("url", "")]
+                        if fb:
+                            return {"user_id": f"port_{port}", "name": f"port_{port}",
+                                    "debug_port": str(port), "_fb": len(fb)}
+                except Exception:
+                    pass
+                return None
+            results = await asyncio.gather(*[check(p) for p in range(50000, 58000)])
+            for r in results:
+                if r and r["debug_port"] not in known_ports:
+                    active.append(r)
 
     return active
 
-# ── Raw CDP helpers ───────────────────────────────────────────────────────────
+# ── CDP helpers ───────────────────────────────────────────────────────────────
 
 async def cdp_get_tabs(debug_port: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=5.0) as client:
@@ -148,18 +121,15 @@ async def cdp_get_tabs(debug_port: str) -> list[dict]:
         return r.json()
 
 _cmd_id = 0
-
 def _next_id() -> int:
     global _cmd_id
     _cmd_id += 1
     return _cmd_id
 
 async def cdp_send(ws, method: str, params: dict = None) -> dict:
-    """Send one CDP command and wait for its response (ignores events)."""
     cmd_id = _next_id()
-    msg = {"id": cmd_id, "method": method, "params": params or {}}
-    await ws.send(json.dumps(msg))
-    deadline = asyncio.get_event_loop().time() + 30.0
+    await ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+    deadline = asyncio.get_event_loop().time() + 20.0
     while asyncio.get_event_loop().time() < deadline:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
@@ -172,29 +142,100 @@ async def cdp_send(ws, method: str, params: dict = None) -> dict:
             break
     return {}
 
-async def cdp_evaluate(ws, expression: str) -> str | None:
+async def cdp_eval(ws, js: str) -> str | None:
     result = await cdp_send(ws, "Runtime.evaluate", {
-        "expression": expression,
+        "expression": js,
         "returnByValue": True,
-        "awaitPromise": True,
-        "timeout": 15000,
+        "awaitPromise": False,
+        "timeout": 10000,
     })
     val = result.get("result", {})
     if val.get("type") == "string":
         return val["value"]
-    if val.get("type") in ("object", "undefined") and "value" in val:
-        return json.dumps(val["value"])
+    if "value" in val:
+        v = val["value"]
+        return json.dumps(v) if not isinstance(v, str) else v
     return None
 
-# ── JS token capture script (injected before page loads) ─────────────────────
+# ── JS: extract token from page memory (no reload) ───────────────────────────
 
-JS_TOKEN_CAPTURE = """
-window.__jarvis_captured_token = null;
+JS_EXTRACT_TOKEN = r"""
 (function() {
-    function captureToken(url, headers) {
+    // Facebook user access tokens start with EAA and are 100+ chars
+    var pat = /EAA[A-Za-z0-9+\/=_\-]{80,}/;
+
+    function find(str) {
+        if (!str || typeof str !== 'string') return null;
+        var m = str.match(pat);
+        return m ? m[0] : null;
+    }
+
+    // 1. Search all <script> tag contents — most reliable
+    var scripts = document.querySelectorAll('script');
+    for (var i = 0; i < scripts.length; i++) {
+        var t = find(scripts[i].textContent);
+        if (t) return t;
+    }
+
+    // 2. Facebook's internal module system
+    try {
+        var at = require('AccessToken');
+        if (at) {
+            var t = at.getAccessToken ? at.getAccessToken() : (at.accessToken || at.token);
+            if (t && pat.test(t)) return t;
+        }
+    } catch(e) {}
+
+    try {
+        var ue = require('UserAuthData');
+        if (ue && ue.getAccessToken) {
+            var t = ue.getAccessToken();
+            if (t && pat.test(t)) return t;
+        }
+    } catch(e) {}
+
+    // 3. Global window properties
+    var globals = ['__accessToken', 'accessToken', '__FB_TOKEN', '_token', 'FB_TOKEN'];
+    for (var g of globals) {
+        if (window[g] && pat.test(window[g])) return window[g];
+    }
+
+    // 4. Large JSON structures (boot data, relay store)
+    var objs = [
+        window.__FB_DATA, window.__PRELOADED_STATE__, window.__RELAY_BOOTSTRAP_DATA__,
+        window.__RELAY_STORE__, window.AdsManagerBoot, window.__BootloaderConfig
+    ];
+    for (var o of objs) {
         try {
-            if (!url || typeof url !== 'string') return;
-            if (!url.includes('graph.facebook.com')) return;
+            var s = JSON.stringify(o);
+            var t = find(s);
+            if (t) return t;
+        } catch(e) {}
+    }
+
+    // 5. Search meta tags
+    var metas = document.querySelectorAll('meta');
+    for (var m of metas) {
+        var c = m.getAttribute('content') || '';
+        var t = find(c);
+        if (t) return t;
+    }
+
+    return null;
+})()
+"""
+
+# ── JS: install fetch/XHR override to capture next token ─────────────────────
+
+JS_INSTALL_OVERRIDE = r"""
+(function() {
+    if (window.__jarvis_override_installed) return 'already_installed';
+    window.__jarvis_captured_token = null;
+    window.__jarvis_override_installed = true;
+
+    function capture(url, headers) {
+        try {
+            if (!url || !url.includes('graph.facebook.com')) return;
             // From URL param
             try {
                 var u = new URL(url);
@@ -202,192 +243,78 @@ window.__jarvis_captured_token = null;
                 if (t && t.length > 30) { window.__jarvis_captured_token = t; return; }
             } catch(e) {}
             // From Authorization header
-            if (headers) {
-                var h = headers;
-                if (typeof h.get === 'function') {
-                    var auth = h.get('Authorization') || h.get('authorization');
-                    if (auth && auth.startsWith('Bearer ')) {
-                        var t = auth.substring(7);
-                        if (t.length > 30) { window.__jarvis_captured_token = t; return; }
-                    }
-                } else if (typeof h === 'object') {
-                    var auth = h['Authorization'] || h['authorization'];
-                    if (auth && auth.startsWith('Bearer ')) {
-                        var t = auth.substring(7);
-                        if (t.length > 30) { window.__jarvis_captured_token = t; return; }
-                    }
+            function checkAuth(h) {
+                if (!h) return;
+                var auth = (typeof h.get === 'function') ? h.get('Authorization') : h['Authorization'];
+                if (!auth) auth = (typeof h.get === 'function') ? h.get('authorization') : h['authorization'];
+                if (auth && auth.startsWith('Bearer ')) {
+                    var t = auth.substring(7);
+                    if (t.length > 30) { window.__jarvis_captured_token = t; }
                 }
             }
+            checkAuth(headers);
         } catch(e) {}
     }
-    // Override fetch
+
     var origFetch = window.fetch;
     window.fetch = function(input, init) {
         try {
             var url = typeof input === 'string' ? input : (input && input.url);
-            captureToken(url, init && init.headers);
+            capture(url, init && init.headers);
         } catch(e) {}
         return origFetch.apply(this, arguments);
     };
-    // Override XHR open
+
     var origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
-        try { captureToken(url, null); } catch(e) {}
-        this.__jarvis_url = url;
+        try { capture(url, null); } catch(e) {}
+        this._url = url;
         return origOpen.apply(this, arguments);
     };
-    // Override XHR setRequestHeader
+
     var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
     XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
         try {
             if (name && name.toLowerCase() === 'authorization' && value && value.startsWith('Bearer ')) {
-                var t = value.substring(7);
-                if (t.length > 30 && this.__jarvis_url && this.__jarvis_url.includes('graph.facebook.com')) {
-                    window.__jarvis_captured_token = t;
+                if (this._url && this._url.includes('graph.facebook.com')) {
+                    window.__jarvis_captured_token = value.substring(7);
                 }
             }
         } catch(e) {}
         return origSetHeader.apply(this, arguments);
     };
-})();
+
+    return 'installed';
+})()
 """
 
-# ── CDP Network interception for access token ─────────────────────────────────
+# ── JS: trigger UI refresh to cause new API calls ────────────────────────────
 
-async def intercept_access_token(ws, reload: bool = True, timeout: float = 35.0) -> str | None:
-    """
-    Enable CDP Network domain with service worker bypass, optionally reload,
-    and listen for graph.facebook.com requests to extract access_token.
-    Also injects JS as a backup capture method.
-    """
-    await cdp_send(ws, "Network.enable")
-    await cdp_send(ws, "Page.enable")
-
-    # KEY FIX: bypass service worker so all requests hit the network
-    # (service workers intercept graph.facebook.com requests silently)
-    await cdp_send(ws, "Network.setBypassServiceWorker", {"bypass": True})
-    print("    Service worker bypass: ON")
-
-    # JS injection backup — captures tokens in page context
-    await cdp_send(ws, "Page.addScriptToEvaluateOnNewDocument", {"source": JS_TOKEN_CAPTURE})
-
-    token = None
-
-    if reload:
-        reload_id = _next_id()
-        await ws.send(json.dumps({"id": reload_id, "method": "Page.reload", "params": {}}))
-        print("    Reloading page to intercept API calls...")
-
-    page_loaded = False
-    deadline = asyncio.get_event_loop().time() + timeout
-
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-            data = json.loads(raw)
-        except asyncio.TimeoutError:
-            # Poll JS-injected token every second
-            if page_loaded:
-                js_token = await cdp_evaluate(ws, "window.__jarvis_captured_token || ''")
-                if js_token and len(js_token) > 30:
-                    token = js_token
-                    print(f"    Token captured via JS injection ({len(token)} chars)")
-                    break
-            continue
-        except Exception:
-            break
-
-        method = data.get("method", "")
-        params = data.get("params", {})
-
-        # ── requestWillBeSent: check URL for access_token param ──────────
-        if method == "Network.requestWillBeSent":
-            url = params.get("request", {}).get("url", "")
-            if "graph.facebook.com" in url:
-                if "access_token=" in url:
-                    parsed = urlparse(url)
-                    qs = parse_qs(parsed.query)
-                    if "access_token" in qs:
-                        token = qs["access_token"][0]
-                        print(f"    Token captured from URL param ({len(token)} chars)")
-                        break
-
-                headers = params.get("request", {}).get("headers", {})
-                for k, v in headers.items():
-                    if k.lower() == "authorization" and v.startswith("Bearer "):
-                        candidate = v[7:]
-                        if len(candidate) > 30:
-                            token = candidate
-                            print(f"    Token captured from Authorization header ({len(token)} chars)")
-                            break
-                if token:
-                    break
-
-        # ── Page loaded: wait a bit then check JS token ──────────────────
-        if method == "Page.loadEventFired":
-            page_loaded = True
-            print("    Page loaded — waiting for async API calls...")
-            await asyncio.sleep(3)
-            js_token = await cdp_evaluate(ws, "window.__jarvis_captured_token || ''")
-            if js_token and len(js_token) > 30:
-                token = js_token
-                print(f"    Token captured via JS after page load ({len(token)} chars)")
-                break
-
-    # Final JS check before giving up
-    if not token:
-        js_token = await cdp_evaluate(ws, "window.__jarvis_captured_token || ''")
-        if js_token and len(js_token) > 30:
-            token = js_token
-            print(f"    Token captured via JS final check ({len(token)} chars)")
-
-    return token
-
-# ── DOM extraction JS (broad selectors for Meta Ads Manager) ──────────────────
-
-DOM_EXTRACT_JS = r"""
+JS_TRIGGER_REFRESH = r"""
 (function() {
-    try {
-        var rows = Array.from(document.querySelectorAll('[role="row"]'));
-        var dataRows = rows.filter(function(r) {
-            return r.querySelectorAll('[role="cell"], [role="gridcell"]').length >= 3;
-        });
-
-        if (dataRows.length === 0) {
-            return JSON.stringify({
-                found: false,
-                url: window.location.href,
-                title: document.title,
-                bodySnippet: document.body ? document.body.innerText.slice(0, 500) : ''
-            });
-        }
-
-        var campaigns = dataRows.map(function(row) {
-            var cells = Array.from(row.querySelectorAll('[role="cell"], [role="gridcell"], td'));
-            var texts = cells.map(function(c) { return c.innerText.trim(); });
-            return {
-                name: texts[0] || '',
-                status: texts[1] || '',
-                budget: texts[2] || '',
-                impressions: texts[4] || '',
-                clicks: texts[5] || '',
-                ctr: texts[6] || '',
-                cpc: texts[7] || '',
-                spend: texts[texts.length - 1] || '',
-            };
-        }).filter(function(c) { return c.name && c.name.length > 1; });
-
-        var urlMatch = window.location.href.match(/act[_=](\d+)/);
-        return JSON.stringify({
-            found: campaigns.length > 0,
-            campaigns: campaigns,
-            accountId: urlMatch ? urlMatch[1] : null,
-            accountName: document.title,
-            url: window.location.href,
-        });
-    } catch(e) {
-        return JSON.stringify({found: false, error: e.message, url: window.location.href});
+    // Try to click a refresh/reload button in Ads Manager
+    var selectors = [
+        '[aria-label="Reload"]',
+        '[aria-label="Refresh"]',
+        '[aria-label="refresh"]',
+        '[data-testid*="refresh"]',
+        '[data-testid*="reload"]',
+    ];
+    for (var sel of selectors) {
+        var btn = document.querySelector(sel);
+        if (btn) { btn.click(); return 'clicked:' + sel; }
     }
+
+    // Try toggling a date range (forces data reload)
+    var dateBtn = document.querySelector('[data-testid="date-range-selector"]') ||
+                  document.querySelector('[aria-label*="Date"]') ||
+                  document.querySelector('[aria-label*="date"]');
+    if (dateBtn) { dateBtn.click(); return 'clicked:date'; }
+
+    // Scroll to trigger any lazy-load
+    window.scrollBy(0, 50);
+    window.scrollBy(0, -50);
+    return 'scrolled';
 })()
 """
 
@@ -402,31 +329,33 @@ async def fetch_via_meta_api(token: str) -> list[dict]:
                 params={"access_token": token, "fields": "id,name,account_status", "limit": 100},
             )
             if r.status_code != 200:
-                print(f"    Meta API accounts error: {r.status_code} {r.text[:200]}")
+                print(f"    Meta API error: {r.status_code} {r.text[:200]}")
                 return []
             accounts = r.json().get("data", [])
             if not accounts:
                 print("    Meta API: no ad accounts returned")
                 return []
 
-            print(f"    Meta API: {len(accounts)} ad accounts")
+            print(f"    Meta API: {len(accounts)} ad accounts found")
             for account in accounts:
                 aid = account["id"]
                 account_name = account.get("name", aid)
 
-                insights_r = await client.get(
+                ins_r = await client.get(
                     f"https://graph.facebook.com/v19.0/{aid}/insights",
                     params={
-                        "access_token": token, "date_preset": "today", "level": "campaign",
+                        "access_token": token,
+                        "date_preset": "today",
+                        "level": "campaign",
                         "fields": "campaign_id,campaign_name,spend,impressions,clicks,ctr,cpm,cpc,reach",
                         "limit": 100,
                     },
                 )
-                insights_data = insights_r.json().get("data", [])
+                ins_data = ins_r.json().get("data", [])
 
                 campaigns = []
                 total_spend = total_impr = total_clicks = 0
-                for ins in insights_data:
+                for ins in ins_data:
                     spend = float(ins.get("spend", 0))
                     impressions = int(ins.get("impressions", 0))
                     clicks = int(ins.get("clicks", 0))
@@ -445,7 +374,7 @@ async def fetch_via_meta_api(token: str) -> list[dict]:
                         "reach": ins.get("reach", ""),
                     })
 
-                avg_ctr = round(total_clicks / total_impr * 100, 2) if total_impr > 0 else 0
+                avg_ctr = round(total_clicks / total_impr * 100, 2) if total_impr else 0
                 results.append({
                     "account_id": aid,
                     "account_name": account_name,
@@ -462,56 +391,68 @@ async def fetch_via_meta_api(token: str) -> list[dict]:
         print(f"    [ERROR] Meta API: {e}")
     return results
 
-# ── DOM campaign parser ───────────────────────────────────────────────────────
+# ── DOM extraction ────────────────────────────────────────────────────────────
 
-def parse_dom_campaigns(raw: list[dict]) -> tuple[list[dict], dict]:
+DOM_EXTRACT_JS = r"""
+(function() {
+    try {
+        var rows = Array.from(document.querySelectorAll('[role="row"]'));
+        var dataRows = rows.filter(function(r) {
+            return r.querySelectorAll('[role="cell"],[role="gridcell"]').length >= 3;
+        });
+        if (!dataRows.length) {
+            return JSON.stringify({found:false, url:location.href, title:document.title,
+                snippet:(document.body||{}).innerText?document.body.innerText.slice(0,500):''});
+        }
+        var campaigns = dataRows.map(function(row) {
+            var cells = Array.from(row.querySelectorAll('[role="cell"],[role="gridcell"],td'));
+            var t = cells.map(function(c){return c.innerText.trim();});
+            return {name:t[0]||'',status:t[1]||'',budget:t[2]||'',impressions:t[4]||'',
+                    clicks:t[5]||'',ctr:t[6]||'',cpc:t[7]||'',spend:t[t.length-1]||''};
+        }).filter(function(c){return c.name&&c.name.length>1;});
+        var urlMatch = location.href.match(/act[_=](\d+)/);
+        return JSON.stringify({found:campaigns.length>0, campaigns:campaigns,
+            accountId:urlMatch?urlMatch[1]:null, accountName:document.title, url:location.href});
+    } catch(e) {
+        return JSON.stringify({found:false, error:e.message, url:location.href});
+    }
+})()
+"""
+
+def parse_dom_campaigns(raw: list[dict]):
     campaigns = []
     total_spend = total_impr = total_clicks = active_count = 0
     for c in raw:
-        name = c.get("name", "")
-        status = c.get("status", "")
-        spend_str = c.get("spend", "")
-        impressions_str = c.get("impressions", "")
-        clicks_str = c.get("clicks", "")
-
-        def parse_num(s):
-            s = re.sub(r"[^\d.]", "", str(s)) if s else ""
+        def pn(s):
+            s = re.sub(r"[^\d.]", "", str(s) if s else "")
             try:
                 return float(s) if "." in s else int(s)
             except Exception:
                 return 0
-
-        spend_val = float(parse_num(spend_str))
-        impr_val = int(parse_num(impressions_str))
-        clicks_val = int(parse_num(clicks_str))
+        spend_val = float(pn(c.get("spend", "")))
+        impr_val = int(pn(c.get("impressions", "")))
+        clicks_val = int(pn(c.get("clicks", "")))
         total_spend += spend_val
         total_impr += impr_val
         total_clicks += clicks_val
-        if "active" in status.lower() or "delivering" in status.lower():
+        if "active" in (c.get("status") or "").lower() or "delivering" in (c.get("status") or "").lower():
             active_count += 1
-        campaigns.append({
-            "name": name, "status": status,
-            "budget": c.get("budget", ""),
-            "spend": spend_str, "impressions": impressions_str,
-            "clicks": clicks_str, "ctr": c.get("ctr", ""),
-            "cpm": c.get("cpm", ""), "cpc": c.get("cpc", ""),
-        })
+        campaigns.append(c)
+    avg_ctr = round(total_clicks / total_impr * 100, 2) if total_impr else 0
+    return campaigns, {"total_spend": round(total_spend, 2), "total_impressions": total_impr,
+                       "total_clicks": total_clicks, "active_campaigns": active_count, "avg_ctr": avg_ctr}
 
-    avg_ctr = round(total_clicks / total_impr * 100, 2) if total_impr > 0 else 0
-    return campaigns, {
-        "total_spend": round(total_spend, 2),
-        "total_impressions": total_impr,
-        "total_clicks": total_clicks,
-        "active_campaigns": active_count,
-        "avg_ctr": avg_ctr,
-    }
+# ── Bad URL detection ─────────────────────────────────────────────────────────
+
+BAD_PATTERNS = [
+    "loginpage", "/login?", "chrome-error", "about:blank",
+    "newtab", "chromewebdata",
+]
+
+def is_bad_url(url: str) -> bool:
+    return any(p in url for p in BAD_PATTERNS)
 
 # ── Profile scraper ───────────────────────────────────────────────────────────
-
-BAD_URL_PATTERNS = [
-    "loginpage", "/login", "chrome-error", "about:blank",
-    "newtab", "chromewebdata", "business.facebook.com/business",
-]
 
 async def scrape_profile(profile: dict) -> dict:
     uid = profile["user_id"]
@@ -530,35 +471,29 @@ async def scrape_profile(profile: dict) -> dict:
         tabs = await cdp_get_tabs(debug_port)
         print(f"  {len(tabs)} tabs open")
 
-        # ── Find Ads Manager tab ──────────────────────────────────────────
-        # Only use tabs already on adsmanager.facebook.com (authenticated session)
-        # Do NOT navigate login pages — they lead to chrome-error on blocked domains
+        # ── Pick best tab: adsmanager.facebook.com preferred ─────────────
+        # Accept any authenticated Facebook tab (not login/error)
         ads_tab = None
         for t in tabs:
             url = t.get("url", "")
-            if "adsmanager.facebook.com" in url:
-                is_bad = any(p in url for p in BAD_URL_PATTERNS)
-                if not is_bad:
+            if "adsmanager.facebook.com" in url and not is_bad_url(url):
+                ads_tab = t
+                print(f"  Found Ads Manager tab: {url[:80]}")
+                break
+
+        if not ads_tab:
+            for t in tabs:
+                url = t.get("url", "")
+                if "facebook.com" in url and not is_bad_url(url):
                     ads_tab = t
-                    print(f"  Found Ads Manager tab: {url[:80]}")
+                    print(f"  Using Facebook tab: {url[:80]}")
                     break
 
         if not ads_tab:
-            # Check if any Facebook tab is not a login/error page
-            for t in tabs:
-                url = t.get("url", "")
-                if "facebook.com" in url:
-                    is_bad = any(p in url for p in BAD_URL_PATTERNS)
-                    if not is_bad:
-                        ads_tab = t
-                        print(f"  Using Facebook tab (not login): {url[:80]}")
-                        break
-
-        if not ads_tab:
-            # All Facebook tabs are login/blocked — skip this profile
-            fb_tabs = [t.get("url", "")[:60] for t in tabs if "facebook.com" in t.get("url", "")]
-            result["error"] = f"No usable Ads Manager tab (all tabs are login/blocked). FB tabs: {fb_tabs}"
-            print(f"  Skipping — only login/blocked tabs found")
+            fb_urls = [t.get("url", "")[:60] for t in tabs if "facebook.com" in t.get("url", "")]
+            result["error"] = f"No usable Facebook tab (all login/blocked): {fb_urls}"
+            print(f"  Skipping — all Facebook tabs are login/blocked")
+            print(f"  ACTION NEEDED: Open adsmanager.facebook.com in this profile manually")
             return result
 
         ws_url = ads_tab.get("webSocketDebuggerUrl")
@@ -566,35 +501,83 @@ async def scrape_profile(profile: dict) -> dict:
             result["error"] = "No webSocketDebuggerUrl"
             return result
 
-        print(f"  Connecting via CDP WS...")
+        current_url = ads_tab.get("url", "")
+        print(f"  Connecting to tab: {current_url[:80]}")
 
-        async with websockets.connect(
-            ws_url,
-            ping_interval=None,
-            open_timeout=15,
-            close_timeout=5,
-        ) as ws:
+        async with websockets.connect(ws_url, ping_interval=None, open_timeout=15, close_timeout=5) as ws:
             await cdp_send(ws, "Runtime.enable")
 
-            current_url = ads_tab.get("url", "")
-            ads_manager_url = "https://adsmanager.facebook.com/adsmanager/manage/campaigns"
-
-            # ── Strategy 1: Network interception (with SW bypass + JS backup) ──
-            if "adsmanager.facebook.com" in current_url:
-                print("  Intercepting network: reloading Ads Manager...")
-                token = await intercept_access_token(ws, reload=True, timeout=35.0)
+            # ── Strategy 1: Extract token from page memory (NO reload) ────
+            print("  Searching page memory for access token...")
+            token = await cdp_eval(ws, JS_EXTRACT_TOKEN)
+            if token and len(token) > 30 and token.startswith("EAA"):
+                print(f"  ✓ Token found in page memory ({len(token)} chars)")
             else:
-                print(f"  Navigating to Ads Manager (current: {current_url[:60]})...")
-                await cdp_send(ws, "Page.enable")
-                nav_id = _next_id()
-                await ws.send(json.dumps({
-                    "id": nav_id, "method": "Page.navigate",
-                    "params": {"url": ads_manager_url}
-                }))
-                token = await intercept_access_token(ws, reload=False, timeout=40.0)
+                token = None
+                print("  Token not in page memory — installing fetch override...")
 
+                # ── Strategy 2: Install override + trigger UI refresh ─────
+                await cdp_eval(ws, JS_INSTALL_OVERRIDE)
+                trigger_result = await cdp_eval(ws, JS_TRIGGER_REFRESH)
+                print(f"  Trigger result: {trigger_result}")
+
+                # Wait for any triggered API calls
+                deadline = asyncio.get_event_loop().time() + 15.0
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(1.0)
+                    captured = await cdp_eval(ws, "window.__jarvis_captured_token || ''")
+                    if captured and len(captured) > 30:
+                        token = captured
+                        print(f"  ✓ Token captured via fetch override ({len(token)} chars)")
+                        break
+
+                # ── Strategy 3: Listen for CDP Network events (30s) ──────
+                if not token:
+                    print("  Listening for CDP network events (30s)...")
+                    await cdp_send(ws, "Network.enable")
+
+                    deadline = asyncio.get_event_loop().time() + 30.0
+                    while asyncio.get_event_loop().time() < deadline:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            data = json.loads(raw)
+                        except asyncio.TimeoutError:
+                            # Poll JS override periodically
+                            captured = await cdp_eval(ws, "window.__jarvis_captured_token || ''")
+                            if captured and len(captured) > 30:
+                                token = captured
+                                print(f"  ✓ Token captured from network event ({len(token)} chars)")
+                                break
+                            continue
+                        except Exception:
+                            break
+
+                        method = data.get("method", "")
+                        params = data.get("params", {})
+
+                        if method == "Network.requestWillBeSent":
+                            url = params.get("request", {}).get("url", "")
+                            if "graph.facebook.com" in url:
+                                if "access_token=" in url:
+                                    parsed = urlparse(url)
+                                    qs = parse_qs(parsed.query)
+                                    if "access_token" in qs:
+                                        token = qs["access_token"][0]
+                                        print(f"  ✓ Token from Network event ({len(token)} chars)")
+                                        break
+                                hdrs = params.get("request", {}).get("headers", {})
+                                for k, v in hdrs.items():
+                                    if k.lower() == "authorization" and v.startswith("Bearer "):
+                                        t = v[7:]
+                                        if len(t) > 30:
+                                            token = t
+                                            print(f"  ✓ Token from Authorization header ({len(t)} chars)")
+                                            break
+                                if token:
+                                    break
+
+            # ── Use token with Meta Marketing API ─────────────────────────
             if token:
-                print(f"  Token captured — querying Meta Marketing API...")
                 api_data = await fetch_via_meta_api(token)
                 if api_data:
                     all_campaigns = []
@@ -614,7 +597,7 @@ async def scrape_profile(profile: dict) -> dict:
                         "total_impressions": total_impr,
                         "total_clicks": total_clicks,
                         "active_campaigns": active,
-                        "avg_ctr": round(total_clicks / total_impr * 100, 2) if total_impr > 0 else 0,
+                        "avg_ctr": round(total_clicks / total_impr * 100, 2) if total_impr else 0,
                     }
                     result["ad_account_name"] = (
                         api_data[0]["account_name"] if len(api_data) == 1
@@ -626,12 +609,11 @@ async def scrape_profile(profile: dict) -> dict:
                 else:
                     print("  Meta API returned no data — falling back to DOM")
             else:
-                print("  No token intercepted — trying DOM scrape")
+                print("  No token found — falling back to DOM scrape")
 
-            # ── Strategy 2: DOM scrape ────────────────────────────────────
-            await asyncio.sleep(5)
-            dom_raw = await cdp_evaluate(ws, DOM_EXTRACT_JS)
-
+            # ── Strategy 4: DOM scrape ────────────────────────────────────
+            await asyncio.sleep(3)
+            dom_raw = await cdp_eval(ws, DOM_EXTRACT_JS)
             if dom_raw:
                 try:
                     dom = json.loads(dom_raw)
@@ -644,13 +626,13 @@ async def scrape_profile(profile: dict) -> dict:
                     campaigns, summary = parse_dom_campaigns(dom.get("campaigns", []))
                     result["campaigns"] = campaigns
                     result["summary"] = summary
-                    print(f"  DOM: {len(campaigns)} campaigns")
+                    print(f"  DOM: {len(campaigns)} campaigns extracted")
                 else:
-                    snippet = dom.get("bodySnippet", "")[:100]
                     url = dom.get("url", "")
-                    result["error"] = f"DOM: no table. URL={url} Page={snippet}"
-                    print(f"  DOM failed — URL: {url}")
-                    print(f"  Page snippet: {snippet}")
+                    snippet = dom.get("snippet", dom.get("bodySnippet", ""))[:100]
+                    result["error"] = f"DOM no table. URL={url}"
+                    print(f"  DOM failed. URL: {url}")
+                    print(f"  Snippet: {snippet}")
             else:
                 result["error"] = "Empty DOM result"
 
