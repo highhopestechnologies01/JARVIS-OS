@@ -4,6 +4,7 @@ import { InfraPanel } from "@/components/panels/InfraPanel";
 import { MemoryPanel } from "@/components/panels/MemoryPanel";
 import { NotificationsPanel } from "@/components/panels/NotificationsPanel";
 import { SchedulerPanel } from "@/components/panels/SchedulerPanel";
+import { VoicePanel } from "@/components/panels/VoicePanel";
 import { Header } from "@/components/layout/Header";
 
 export const dynamic = "force-dynamic";
@@ -45,6 +46,11 @@ export default function Dashboard() {
           <Suspense fallback={<PanelSkeleton title="Notifications" />}>
             <NotificationsPanel />
           </Suspense>
+        </div>
+
+        {/* Voice Interface — full width */}
+        <div className="col-span-12 lg:col-span-4">
+          <VoicePanel />
         </div>
       </main>
     </div>

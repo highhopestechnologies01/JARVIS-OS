@@ -14,7 +14,7 @@ from prometheus_client import make_asgi_app
 from src.config import settings
 from src.db.connection import init_db, close_db
 from src.core.scheduler import scheduler
-from src.api.routes import health, briefings, memory, tasks, notifications
+from src.api.routes import health, briefings, memory, tasks, notifications, voice
 
 # Configure structured logging
 structlog.configure(
@@ -76,3 +76,4 @@ app.include_router(briefings.router, prefix="/api/v1/briefings", tags=["briefing
 app.include_router(memory.router, prefix="/api/v1/memory", tags=["memory"])
 app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
 app.include_router(notifications.router, prefix="/api/v1/notifications", tags=["notifications"])
+app.include_router(voice.router, prefix="/api/v1/voice", tags=["voice"])
