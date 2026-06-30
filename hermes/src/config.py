@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     # App
     app_name: str = "Hermes"
     env: str = "production"
-    secret_key: str
+    secret_key: str = ""  # SECRET_KEY in .env
     log_level: str = "INFO"
     port: int = 8000
 
