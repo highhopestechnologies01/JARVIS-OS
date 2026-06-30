@@ -1,0 +1,111 @@
+{
+  "name": "JARVIS — Health Alert Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "jarvis-health-alert",
+        "responseMode": "onReceived",
+        "responseData": "allEntries"
+      },
+      "id": "webhook-trigger",
+      "name": "Health Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "jarvis-health-alert"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst failures = body.failures || [];\nconst statuses = body.statuses || {};\nconst timestamp = new Date().toISOString();\n\nconst summary = failures.length > 0\n  ? `⚠️ ${failures.length} service(s) DOWN: ${failures.join(', ')}`\n  : '✅ All services healthy';\n\nconst allStatuses = Object.entries(statuses)\n  .map(([k,v]) => `${v === 'ok' ? '✓' : '✗'} ${k}: ${v}`)\n  .join('\\n');\n\nreturn [{\n  json: {\n    summary,\n    failures,\n    statuses,\n    all_statuses_text: allStatuses,\n    timestamp,\n    has_failures: failures.length > 0,\n    importance: failures.length > 0 ? 9 : 3\n  }\n}];"
+      },
+      "id": "format-alert",
+      "name": "Format Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.has_failures }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "check-failures",
+      "name": "Has Failures?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/memory",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ type: 'health_alert', topic: 'infrastructure_failure', content: $json.summary + '\\n\\n' + $json.all_statuses_text, importance: $json.importance, source: 'n8n_health_alert_workflow' }) }}"
+      },
+      "id": "store-alert-memory",
+      "name": "Store Alert in Hermes Memory",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/events",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ type: 'n8n.health_alert_processed', source: 'n8n_health_alert_workflow', payload: { summary: $json.summary, failures: $json.failures, timestamp: $json.timestamp } }) }}"
+      },
+      "id": "log-event",
+      "name": "Log Event to Hermes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 400]
+    }
+  ],
+  "connections": {
+    "Health Alert Webhook": {
+      "main": [[{ "node": "Format Alert", "type": "main", "index": 0 }]]
+    },
+    "Format Alert": {
+      "main": [[{ "node": "Has Failures?", "type": "main", "index": 0 }]]
+    },
+    "Has Failures?": {
+      "main": [
+        [{ "node": "Store Alert in Hermes Memory", "type": "main", "index": 0 }],
+        [{ "node": "Log Event to Hermes", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["jarvis", "infrastructure", "alerts"]
+}

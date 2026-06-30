@@ -1,0 +1,101 @@
+{
+  "name": "JARVIS — Prometheus Metrics Snapshot",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://jarvis-prometheus:9090/api/v1/query?query=up"
+      },
+      "id": "fetch-up-metrics",
+      "name": "Fetch Service Up/Down",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://jarvis-prometheus:9090/api/v1/query?query=node_memory_MemAvailable_bytes"
+      },
+      "id": "fetch-memory",
+      "name": "Fetch Memory Available",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get results from both HTTP requests\nconst allItems = $input.all();\nconst upData = allItems[0]?.json;\nconst memData = allItems[1]?.json;\n\n// Parse up/down status\nconst services = [];\nif (upData?.data?.result) {\n  for (const r of upData.data.result) {\n    const name = r.metric?.job || r.metric?.instance || 'unknown';\n    const status = r.value?.[1] === '1' ? 'up' : 'down';\n    services.push(`${status === 'up' ? '✓' : '✗'} ${name}: ${status}`);\n  }\n}\n\n// Parse memory\nlet memGB = null;\nif (memData?.data?.result?.[0]?.value?.[1]) {\n  const bytes = parseFloat(memData.data.result[0].value[1]);\n  memGB = (bytes / 1024 / 1024 / 1024).toFixed(2);\n}\n\nconst timestamp = new Date().toISOString();\nconst servicesText = services.length > 0 ? services.join('\\n') : 'no metrics available';\nconst memText = memGB ? `Memory available: ${memGB} GB` : 'Memory: unavailable';\n\nconst summary = `Hourly metrics snapshot (${new Date().toLocaleTimeString()}):\\n${memText}\\nServices:\\n${servicesText}`;\n\nreturn [{\n  json: {\n    summary,\n    memory_gb_available: memGB,\n    services_up: services.filter(s => s.includes('✓')).length,\n    services_down: services.filter(s => s.includes('✗')).length,\n    timestamp\n  }\n}];"
+      },
+      "id": "format-metrics",
+      "name": "Format Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/events",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ type: 'n8n.metrics_snapshot', source: 'n8n_prometheus_snapshot', payload: { memory_gb_available: $json.memory_gb_available, services_up: $json.services_up, services_down: $json.services_down, summary: $json.summary, timestamp: $json.timestamp } }) }}"
+      },
+      "id": "store-metrics",
+      "name": "Store Metrics in Hermes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 300]
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          { "node": "Fetch Service Up/Down", "type": "main", "index": 0 },
+          { "node": "Fetch Memory Available", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch Service Up/Down": {
+      "main": [[{ "node": "Format Metrics", "type": "main", "index": 0 }]]
+    },
+    "Fetch Memory Available": {
+      "main": [[{ "node": "Format Metrics", "type": "main", "index": 1 }]]
+    },
+    "Format Metrics": {
+      "main": [[{ "node": "Store Metrics in Hermes", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["jarvis", "metrics", "prometheus"]
+}

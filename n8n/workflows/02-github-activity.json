@@ -1,0 +1,144 @@
+{
+  "name": "JARVIS — GitHub Activity Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/highhopestechnologies01/JARVIS-OS/commits?per_page=10",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "JARVIS-OS/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.v3+json"
+            }
+          ]
+        }
+      },
+      "id": "fetch-commits",
+      "name": "Fetch Recent Commits",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const commits = $input.all().map(item => item.json);\n\nif (!commits || commits.length === 0) {\n  return [{ json: { skip: true } }];\n}\n\nconst lines = commits.slice(0, 5).map(c => {\n  const sha = c.sha ? c.sha.substring(0, 7) : 'unknown';\n  const msg = c.commit?.message?.split('\\n')[0] || 'no message';\n  const author = c.commit?.author?.name || 'unknown';\n  const date = c.commit?.author?.date ? new Date(c.commit.author.date).toLocaleDateString() : '';\n  return `${sha} — ${msg} (${author}, ${date})`;\n});\n\nconst summary = `Recent JARVIS-OS commits (last 6h check):\\n${lines.join('\\n')}`;\n\nreturn [{\n  json: {\n    summary,\n    commit_count: commits.length,\n    latest_sha: commits[0]?.sha?.substring(0, 7),\n    latest_message: commits[0]?.commit?.message?.split('\\n')[0],\n    timestamp: new Date().toISOString(),\n    skip: false\n  }\n}];"
+      },
+      "id": "format-commits",
+      "name": "Format Commit Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.skip }}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "id": "check-commits",
+      "name": "Has Commits?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/memory",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ type: 'github_activity', topic: 'jarvis_os_commits', content: $json.summary, importance: 4, source: 'n8n_github_digest' }) }}"
+      },
+      "id": "store-commits",
+      "name": "Store in Hermes Memory",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/events",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ type: 'n8n.github_digest_completed', source: 'n8n_github_digest', payload: { commit_count: $json.commit_count, latest_sha: $json.latest_sha, latest_message: $json.latest_message } }) }}"
+      },
+      "id": "log-event",
+      "name": "Log Event to Hermes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 400]
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [[{ "node": "Fetch Recent Commits", "type": "main", "index": 0 }]]
+    },
+    "Fetch Recent Commits": {
+      "main": [[{ "node": "Format Commit Digest", "type": "main", "index": 0 }]]
+    },
+    "Format Commit Digest": {
+      "main": [[{ "node": "Has Commits?", "type": "main", "index": 0 }]]
+    },
+    "Has Commits?": {
+      "main": [
+        [{ "node": "Store in Hermes Memory", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Store in Hermes Memory": {
+      "main": [[{ "node": "Log Event to Hermes", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["jarvis", "github", "digest"]
+}
