@@ -23,6 +23,8 @@ def register_core_jobs():
         infrastructure_health_check,
         weekly_report,
         consolidate_memories,
+        pattern_analysis,
+        autonomous_planning,
     )
 
     jobs = [
@@ -49,6 +51,18 @@ def register_core_jobs():
             "func": consolidate_memories,
             "trigger": CronTrigger(hour=2, minute=0),
             "name": "Memory Consolidation",
+        },
+        {
+            "id": "pattern_analysis",
+            "func": pattern_analysis,
+            "trigger": CronTrigger(hour=3, minute=0),
+            "name": "AI Pattern Analysis",
+        },
+        {
+            "id": "autonomous_planning",
+            "func": autonomous_planning,
+            "trigger": CronTrigger(day_of_week="sun", hour=6, minute=0, timezone="America/New_York"),
+            "name": "Autonomous Weekly Planning",
         },
     ]
 

@@ -13,19 +13,20 @@ log = structlog.get_logger()
 async def daily_briefing():
     """
     Run every day at 8am ET.
-    Generates and delivers the daily executive briefing.
+    Generates and delivers the daily executive briefing using full system context.
     """
     from src.db.connection import AsyncSessionLocal
     from src.db.models import Briefing, Event
     from src.core.planner import planner
     from src.core.notifications import dispatcher
+    from src.core.context_builder import context_builder
+    from sqlalchemy import select
 
     log.info("jobs.daily_briefing.start")
     today = date.today()
 
     async with AsyncSessionLocal() as db:
         # Check if already generated today
-        from sqlalchemy import select
         existing = await db.execute(
             select(Briefing).where(Briefing.date == today)
         )
@@ -33,14 +34,11 @@ async def daily_briefing():
             log.info("jobs.daily_briefing.already_exists", date=str(today))
             return
 
-        # Gather context
-        context = {
-            "date": today.strftime("%A, %B %d, %Y"),
-            "infrastructure": await _get_infra_status(),
-            "recent_events": await _get_recent_events(db),
-        }
+        # Build rich context from all system data
+        context = await context_builder.build_briefing_context(db)
+        context["date"] = today.strftime("%A, %B %d, %Y")
 
-        # Generate briefing
+        # Generate briefing with Claude
         content = await planner.generate_briefing(context, today)
         summary = await planner.summarize(content)
 
@@ -49,7 +47,7 @@ async def daily_briefing():
             date=today,
             content=content,
             summary=summary,
-            sources=["infrastructure", "events", "memory"],
+            sources=["infrastructure", "events", "memory", "pattern_insights"],
             status="generated",
         )
         db.add(briefing)
@@ -165,15 +163,116 @@ async def consolidate_memories():
     log.info("jobs.memory_consolidation.complete", pruned=pruned)
 
 
-# --- Helpers ---
+async def pattern_analysis():
+    """
+    Run every day at 3am.
+    Uses Claude Haiku to analyze system events and store pattern insights as memories.
+    """
+    from src.db.connection import AsyncSessionLocal
+    from src.db.models import Event
+    from src.core.pattern_analyzer import pattern_analyzer
+
+    log.info("jobs.pattern_analysis.start")
+    async with AsyncSessionLocal() as db:
+        insights = await pattern_analyzer.analyze(db)
+        db.add(Event(
+            type="pattern_analysis.completed",
+            source="pattern_analysis_job",
+            payload={"insights_count": len(insights), "insights": insights},
+        ))
+        await db.commit()
+    log.info("jobs.pattern_analysis.complete", insights=len(insights))
+
+
+async def autonomous_planning():
+    """
+    Run every Sunday at 6am ET.
+    JARVIS autonomously reviews the week and generates a forward plan,
+    stored as a briefing for the coming week.
+    """
+    from src.db.connection import AsyncSessionLocal
+    from src.db.models import Briefing, Event, Memory
+    from src.core.planner import planner
+    from src.core.context_builder import context_builder
+    from sqlalchemy import select
+
+    log.info("jobs.autonomous_planning.start")
+    today = date.today()
+
+    async with AsyncSessionLocal() as db:
+        # Build full context
+        context = await context_builder.build_briefing_context(db)
+
+        # Generate weekly plan with Claude Opus
+        from src.config import settings
+        from anthropic import AsyncAnthropic
+
+        client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+        context_text = planner._format_context(context)
+        response = await client.messages.create(
+            model="claude-opus-4-8",
+            max_tokens=2500,
+            system="""You are Hermes, JARVIS OS's autonomous planning agent for Thomas Shelby.
+
+Each Sunday you review the past week and generate a forward plan for the coming week.
+
+Your plan must include:
+1. Last Week Review — what happened, what worked, what didn't
+2. This Week's Priorities — top 5 focus areas with specific actions
+3. Risk Watch — items to monitor proactively
+4. Automated Actions — tasks Hermes will handle autonomously
+5. Requests for Thomas — decisions or inputs needed from the user
+
+Be specific, direct, and actionable. No filler.""",
+            messages=[{
+                "role": "user",
+                "content": f"Generate the weekly autonomous plan for the week starting {today.strftime('%A, %B %d, %Y')}.\n\nSystem context:\n{context_text}"
+            }],
+        )
+
+        plan_content = response.content[0].text
+
+        # Store as a special briefing
+        from datetime import timedelta
+        plan_date = today + timedelta(days=1)  # Label it as Monday
+        db.add(Briefing(
+            date=plan_date,
+            content=plan_content,
+            summary=f"Autonomous weekly plan — week of {plan_date.strftime('%B %d')}",
+            sources=["autonomous_planning", "pattern_analysis", "events", "memory"],
+            status="delivered",
+            delivered_at=datetime.now(timezone.utc),
+        ))
+
+        # Store as a high-importance memory
+        db.add(Memory(
+            type="weekly_plan",
+            topic=f"week_of_{today.isoformat()}",
+            content=plan_content[:500] + "...",
+            importance=9,
+            source="autonomous_planning_job",
+        ))
+
+        db.add(Event(
+            type="autonomous_planning.completed",
+            source="autonomous_planning_job",
+            payload={"week_start": str(plan_date), "tokens": response.usage.output_tokens},
+        ))
+
+        await db.commit()
+        log.info("jobs.autonomous_planning.complete", date=str(plan_date))
+
+
+# --- Helpers (kept for backward compat) ---
 
 async def _get_infra_status() -> dict:
-    """Quick check of key service health for briefing context."""
-    return {"status": "checking via health_check job"}
+    """Quick status stub — full context now via context_builder."""
+    return {"status": "see infrastructure key in full context"}
 
 
 async def _get_recent_events(db) -> list[str]:
-    """Get recent Hermes events for briefing context."""
+    """Legacy helper — full context now via context_builder."""
     from sqlalchemy import select
     from src.db.models import Event
     result = await db.execute(

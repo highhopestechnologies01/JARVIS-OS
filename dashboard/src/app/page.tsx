@@ -5,6 +5,7 @@ import { MemoryPanel } from "@/components/panels/MemoryPanel";
 import { NotificationsPanel } from "@/components/panels/NotificationsPanel";
 import { SchedulerPanel } from "@/components/panels/SchedulerPanel";
 import { VoicePanel } from "@/components/panels/VoicePanel";
+import { IntelligencePanel } from "@/components/panels/IntelligencePanel";
 import { Header } from "@/components/layout/Header";
 
 export const dynamic = "force-dynamic";
@@ -48,7 +49,11 @@ export default function Dashboard() {
           </Suspense>
         </div>
 
-        {/* Voice Interface — full width */}
+        {/* Intelligence + Voice row */}
+        <div className="col-span-12 lg:col-span-8">
+          <IntelligencePanel />
+        </div>
+
         <div className="col-span-12 lg:col-span-4">
           <VoicePanel />
         </div>
