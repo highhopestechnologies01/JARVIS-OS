@@ -5,10 +5,12 @@ Strategy:
   1. Query Ads Power local API for active browser profiles
   2. For each profile: get CDP debug port, find Ads Manager tab
   3. Use raw CDP websockets — enable Network domain, reload page
-  4. Intercept graph.facebook.com requests to capture access_token
-  5. Call Meta Marketing API with captured token for clean data
-  6. Fallback: DOM scrape with broad selectors
-  7. POST results to Hermes
+  4. BYPASS SERVICE WORKER so graph.facebook.com requests are visible
+  5. Intercept graph.facebook.com requests to capture access_token
+  6. JS injection backup: override fetch/XHR in page context
+  7. Call Meta Marketing API with captured token for clean data
+  8. Fallback: DOM scrape with broad selectors
+  9. POST results to Hermes
 
 Run every 5 minutes via Windows Task Scheduler.
 Configure via config.json in this directory.
@@ -51,7 +53,6 @@ async def scan_chrome_ports(port_start: int = 52000, port_end: int = 54500) -> l
                 if r.status_code == 200:
                     tabs = r.json()
                     if isinstance(tabs, list):
-                        # Prefer ports with Facebook tabs
                         fb_tabs = [t for t in tabs if "facebook.com" in t.get("url", "")]
                         return {"user_id": f"port_{port}", "name": f"port_{port}",
                                 "debug_port": str(port), "tabs": tabs, "fb_tabs": len(fb_tabs)}
@@ -65,7 +66,6 @@ async def scan_chrome_ports(port_start: int = 52000, port_end: int = 54500) -> l
             if r:
                 found.append(r)
 
-    # Sort: ports with Facebook tabs first
     found.sort(key=lambda x: x.get("fb_tabs", 0), reverse=True)
     print(f"  Port scan found {len(found)} Chrome instances: {[x['debug_port'] for x in found]}")
     return found
@@ -147,10 +147,6 @@ async def cdp_get_tabs(debug_port: str) -> list[dict]:
         r = await client.get(f"http://localhost:{debug_port}/json/list")
         return r.json()
 
-async def cdp_close_tab(debug_port: str, tab_id: str) -> None:
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        await client.get(f"http://localhost:{debug_port}/json/close/{tab_id}")
-
 _cmd_id = 0
 
 def _next_id() -> int:
@@ -190,32 +186,113 @@ async def cdp_evaluate(ws, expression: str) -> str | None:
         return json.dumps(val["value"])
     return None
 
+# ── JS token capture script (injected before page loads) ─────────────────────
+
+JS_TOKEN_CAPTURE = """
+window.__jarvis_captured_token = null;
+(function() {
+    function captureToken(url, headers) {
+        try {
+            if (!url || typeof url !== 'string') return;
+            if (!url.includes('graph.facebook.com')) return;
+            // From URL param
+            try {
+                var u = new URL(url);
+                var t = u.searchParams.get('access_token');
+                if (t && t.length > 30) { window.__jarvis_captured_token = t; return; }
+            } catch(e) {}
+            // From Authorization header
+            if (headers) {
+                var h = headers;
+                if (typeof h.get === 'function') {
+                    var auth = h.get('Authorization') || h.get('authorization');
+                    if (auth && auth.startsWith('Bearer ')) {
+                        var t = auth.substring(7);
+                        if (t.length > 30) { window.__jarvis_captured_token = t; return; }
+                    }
+                } else if (typeof h === 'object') {
+                    var auth = h['Authorization'] || h['authorization'];
+                    if (auth && auth.startsWith('Bearer ')) {
+                        var t = auth.substring(7);
+                        if (t.length > 30) { window.__jarvis_captured_token = t; return; }
+                    }
+                }
+            }
+        } catch(e) {}
+    }
+    // Override fetch
+    var origFetch = window.fetch;
+    window.fetch = function(input, init) {
+        try {
+            var url = typeof input === 'string' ? input : (input && input.url);
+            captureToken(url, init && init.headers);
+        } catch(e) {}
+        return origFetch.apply(this, arguments);
+    };
+    // Override XHR open
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        try { captureToken(url, null); } catch(e) {}
+        this.__jarvis_url = url;
+        return origOpen.apply(this, arguments);
+    };
+    // Override XHR setRequestHeader
+    var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        try {
+            if (name && name.toLowerCase() === 'authorization' && value && value.startsWith('Bearer ')) {
+                var t = value.substring(7);
+                if (t.length > 30 && this.__jarvis_url && this.__jarvis_url.includes('graph.facebook.com')) {
+                    window.__jarvis_captured_token = t;
+                }
+            }
+        } catch(e) {}
+        return origSetHeader.apply(this, arguments);
+    };
+})();
+"""
+
 # ── CDP Network interception for access token ─────────────────────────────────
 
-async def intercept_access_token(ws, reload: bool = True, timeout: float = 25.0) -> str | None:
+async def intercept_access_token(ws, reload: bool = True, timeout: float = 35.0) -> str | None:
     """
-    Enable CDP Network domain, optionally reload the page, then listen for
-    outgoing requests to graph.facebook.com and extract the access_token.
-    Returns the token string or None.
+    Enable CDP Network domain with service worker bypass, optionally reload,
+    and listen for graph.facebook.com requests to extract access_token.
+    Also injects JS as a backup capture method.
     """
     await cdp_send(ws, "Network.enable")
     await cdp_send(ws, "Page.enable")
 
+    # KEY FIX: bypass service worker so all requests hit the network
+    # (service workers intercept graph.facebook.com requests silently)
+    await cdp_send(ws, "Network.setBypassServiceWorker", {"bypass": True})
+    print("    Service worker bypass: ON")
+
+    # JS injection backup — captures tokens in page context
+    await cdp_send(ws, "Page.addScriptToEvaluateOnNewDocument", {"source": JS_TOKEN_CAPTURE})
+
     token = None
 
     if reload:
-        # Fire page reload — don't await via cdp_send because we need to
-        # stream events concurrently
         reload_id = _next_id()
         await ws.send(json.dumps({"id": reload_id, "method": "Page.reload", "params": {}}))
         print("    Reloading page to intercept API calls...")
 
+    page_loaded = False
     deadline = asyncio.get_event_loop().time() + timeout
+
     while asyncio.get_event_loop().time() < deadline:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
             data = json.loads(raw)
         except asyncio.TimeoutError:
+            # Poll JS-injected token every second
+            if page_loaded:
+                js_token = await cdp_evaluate(ws, "window.__jarvis_captured_token || ''")
+                if js_token and len(js_token) > 30:
+                    token = js_token
+                    print(f"    Token captured via JS injection ({len(token)} chars)")
+                    break
             continue
         except Exception:
             break
@@ -226,36 +303,43 @@ async def intercept_access_token(ws, reload: bool = True, timeout: float = 25.0)
         # ── requestWillBeSent: check URL for access_token param ──────────
         if method == "Network.requestWillBeSent":
             url = params.get("request", {}).get("url", "")
-            if "graph.facebook.com" in url and "access_token=" in url:
-                parsed = urlparse(url)
-                qs = parse_qs(parsed.query)
-                if "access_token" in qs:
-                    token = qs["access_token"][0]
-                    print(f"    Token captured from URL param ({len(token)} chars)")
+            if "graph.facebook.com" in url:
+                if "access_token=" in url:
+                    parsed = urlparse(url)
+                    qs = parse_qs(parsed.query)
+                    if "access_token" in qs:
+                        token = qs["access_token"][0]
+                        print(f"    Token captured from URL param ({len(token)} chars)")
+                        break
+
+                headers = params.get("request", {}).get("headers", {})
+                for k, v in headers.items():
+                    if k.lower() == "authorization" and v.startswith("Bearer "):
+                        candidate = v[7:]
+                        if len(candidate) > 30:
+                            token = candidate
+                            print(f"    Token captured from Authorization header ({len(token)} chars)")
+                            break
+                if token:
                     break
 
-            # Check request headers for Authorization: Bearer <token>
-            headers = params.get("request", {}).get("headers", {})
-            for k, v in headers.items():
-                if k.lower() == "authorization" and v.startswith("Bearer "):
-                    candidate = v[7:]
-                    if len(candidate) > 30:
-                        token = candidate
-                        print(f"    Token captured from Authorization header ({len(token)} chars)")
-                        break
-            if token:
+        # ── Page loaded: wait a bit then check JS token ──────────────────
+        if method == "Page.loadEventFired":
+            page_loaded = True
+            print("    Page loaded — waiting for async API calls...")
+            await asyncio.sleep(3)
+            js_token = await cdp_evaluate(ws, "window.__jarvis_captured_token || ''")
+            if js_token and len(js_token) > 30:
+                token = js_token
+                print(f"    Token captured via JS after page load ({len(token)} chars)")
                 break
 
-        # ── responseReceived: look for graph.facebook.com responses ──────
-        if method == "Network.responseReceived":
-            url = params.get("response", {}).get("url", "")
-            if "graph.facebook.com" in url:
-                # Token should have appeared in a prior requestWillBeSent
-                pass
-
-        # Stop listening once page fully loaded (if we still have no token, keep going)
-        if method == "Page.loadEventFired" and token:
-            break
+    # Final JS check before giving up
+    if not token:
+        js_token = await cdp_evaluate(ws, "window.__jarvis_captured_token || ''")
+        if js_token and len(js_token) > 30:
+            token = js_token
+            print(f"    Token captured via JS final check ({len(token)} chars)")
 
     return token
 
@@ -264,25 +348,18 @@ async def intercept_access_token(ws, reload: bool = True, timeout: float = 25.0)
 DOM_EXTRACT_JS = r"""
 (function() {
     try {
-        // Meta Ads Manager uses role="row" heavily inside a custom grid
         var rows = Array.from(document.querySelectorAll('[role="row"]'));
-
-        // Filter to rows that look like data rows (have multiple cells)
         var dataRows = rows.filter(function(r) {
             return r.querySelectorAll('[role="cell"], [role="gridcell"]').length >= 3;
         });
 
         if (dataRows.length === 0) {
-            // Broader: any div that has spend data
-            var spendEls = document.querySelectorAll('[data-column-id], [data-cell-id]');
-            if (spendEls.length === 0) {
-                return JSON.stringify({
-                    found: false,
-                    url: window.location.href,
-                    title: document.title,
-                    bodySnippet: document.body ? document.body.innerText.slice(0, 500) : ''
-                });
-            }
+            return JSON.stringify({
+                found: false,
+                url: window.location.href,
+                title: document.title,
+                bodySnippet: document.body ? document.body.innerText.slice(0, 500) : ''
+            });
         }
 
         var campaigns = dataRows.map(function(row) {
@@ -325,7 +402,7 @@ async def fetch_via_meta_api(token: str) -> list[dict]:
                 params={"access_token": token, "fields": "id,name,account_status", "limit": 100},
             )
             if r.status_code != 200:
-                print(f"    Meta API accounts error: {r.status_code} {r.text[:100]}")
+                print(f"    Meta API accounts error: {r.status_code} {r.text[:200]}")
                 return []
             accounts = r.json().get("data", [])
             if not accounts:
@@ -401,7 +478,7 @@ def parse_dom_campaigns(raw: list[dict]) -> tuple[list[dict], dict]:
             s = re.sub(r"[^\d.]", "", str(s)) if s else ""
             try:
                 return float(s) if "." in s else int(s)
-            except:
+            except Exception:
                 return 0
 
         spend_val = float(parse_num(spend_str))
@@ -431,6 +508,11 @@ def parse_dom_campaigns(raw: list[dict]) -> tuple[list[dict], dict]:
 
 # ── Profile scraper ───────────────────────────────────────────────────────────
 
+BAD_URL_PATTERNS = [
+    "loginpage", "/login", "chrome-error", "about:blank",
+    "newtab", "chromewebdata", "business.facebook.com/business",
+]
+
 async def scrape_profile(profile: dict) -> dict:
     uid = profile["user_id"]
     name = profile["name"]
@@ -448,39 +530,35 @@ async def scrape_profile(profile: dict) -> dict:
         tabs = await cdp_get_tabs(debug_port)
         print(f"  {len(tabs)} tabs open")
 
-        # ── Find best tab to use ──────────────────────────────────────────
+        # ── Find Ads Manager tab ──────────────────────────────────────────
+        # Only use tabs already on adsmanager.facebook.com (authenticated session)
+        # Do NOT navigate login pages — they lead to chrome-error on blocked domains
         ads_tab = None
-        # Prefer existing Ads Manager tab
         for t in tabs:
-            if "adsmanager.facebook.com" in t.get("url", ""):
-                ads_tab = t
-                print(f"  Found Ads Manager tab: {t.get('url','')[:60]}")
-                break
-
-        # Fall back to any Facebook tab
-        if not ads_tab:
-            for t in tabs:
-                if "facebook.com" in t.get("url", ""):
+            url = t.get("url", "")
+            if "adsmanager.facebook.com" in url:
+                is_bad = any(p in url for p in BAD_URL_PATTERNS)
+                if not is_bad:
                     ads_tab = t
-                    print(f"  Using Facebook tab: {t.get('url','')[:60]}")
+                    print(f"  Found Ads Manager tab: {url[:80]}")
                     break
 
-        # Fall back to blank tab
         if not ads_tab:
+            # Check if any Facebook tab is not a login/error page
             for t in tabs:
-                u = t.get("url", "")
-                if u in ("about:blank", "chrome://newtab/", "") or "newtab" in u:
-                    ads_tab = t
-                    print("  Using blank tab")
-                    break
-
-        # Last resort: first tab
-        if not ads_tab and tabs:
-            ads_tab = tabs[0]
-            print(f"  Using first tab: {ads_tab.get('url','')[:60]}")
+                url = t.get("url", "")
+                if "facebook.com" in url:
+                    is_bad = any(p in url for p in BAD_URL_PATTERNS)
+                    if not is_bad:
+                        ads_tab = t
+                        print(f"  Using Facebook tab (not login): {url[:80]}")
+                        break
 
         if not ads_tab:
-            result["error"] = "No tabs available"
+            # All Facebook tabs are login/blocked — skip this profile
+            fb_tabs = [t.get("url", "")[:60] for t in tabs if "facebook.com" in t.get("url", "")]
+            result["error"] = f"No usable Ads Manager tab (all tabs are login/blocked). FB tabs: {fb_tabs}"
+            print(f"  Skipping — only login/blocked tabs found")
             return result
 
         ws_url = ads_tab.get("webSocketDebuggerUrl")
@@ -501,27 +579,19 @@ async def scrape_profile(profile: dict) -> dict:
             current_url = ads_tab.get("url", "")
             ads_manager_url = "https://adsmanager.facebook.com/adsmanager/manage/campaigns"
 
-            # ── Strategy 1: Network interception for access token ─────────
-            # Only reload if already on Ads Manager (authenticated session).
-            # For login/blocked/error pages, navigate directly to adsmanager.
-            bad_url = any(x in current_url for x in [
-                "loginpage", "login", "chrome-error", "about:blank",
-                "newtab", "chromewebdata", "business.facebook.com/business"
-            ])
-
-            await cdp_send(ws, "Page.enable")
-
-            if "adsmanager.facebook.com" in current_url and not bad_url:
+            # ── Strategy 1: Network interception (with SW bypass + JS backup) ──
+            if "adsmanager.facebook.com" in current_url:
                 print("  Intercepting network: reloading Ads Manager...")
-                token = await intercept_access_token(ws, reload=True, timeout=30.0)
+                token = await intercept_access_token(ws, reload=True, timeout=35.0)
             else:
-                print(f"  Navigating to Ads Manager (current: {current_url[:50]})...")
+                print(f"  Navigating to Ads Manager (current: {current_url[:60]})...")
+                await cdp_send(ws, "Page.enable")
                 nav_id = _next_id()
                 await ws.send(json.dumps({
                     "id": nav_id, "method": "Page.navigate",
                     "params": {"url": ads_manager_url}
                 }))
-                token = await intercept_access_token(ws, reload=False, timeout=35.0)
+                token = await intercept_access_token(ws, reload=False, timeout=40.0)
 
             if token:
                 print(f"  Token captured — querying Meta Marketing API...")
@@ -558,7 +628,7 @@ async def scrape_profile(profile: dict) -> dict:
             else:
                 print("  No token intercepted — trying DOM scrape")
 
-            # ── Strategy 2: DOM scrape (wait for page to settle) ──────────
+            # ── Strategy 2: DOM scrape ────────────────────────────────────
             await asyncio.sleep(5)
             dom_raw = await cdp_evaluate(ws, DOM_EXTRACT_JS)
 
