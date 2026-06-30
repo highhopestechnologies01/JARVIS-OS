@@ -41,15 +41,25 @@ async def get_today_briefing(db: AsyncSession = Depends(get_db)):
         return {"id": str(briefing.id), "date": str(briefing.date), "content": briefing.content,
                 "summary": briefing.summary, "status": briefing.status}
 
-    # Generate on demand
-    content = await planner.generate_briefing({"date": str(today)}, today)
-    summary = await planner.summarize(content)
+    # Generate on demand — gracefully handle API errors
+    try:
+        content = await planner.generate_briefing({"date": str(today)}, today)
+        summary = await planner.summarize(content)
+        status = "generated"
+    except Exception as e:
+        error_msg = str(e)
+        if "credit" in error_msg.lower() or "billing" in error_msg.lower():
+            content = "Briefing unavailable: Anthropic API credits exhausted. Please add credits at console.anthropic.com."
+        else:
+            content = f"Briefing generation failed: {error_msg[:200]}"
+        summary = None
+        status = "error"
 
     briefing = Briefing(
         date=today,
         content=content,
         summary=summary,
-        status="generated",
+        status=status,
     )
     db.add(briefing)
     await db.commit()
