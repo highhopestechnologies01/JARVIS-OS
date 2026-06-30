@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # RDP Scraper (Meta Ads ingest auth)
+    scraper_token: str = ""
+
     # Notion
     notion_api_key: str = ""
     notion_dashboard_page_id: str = ""

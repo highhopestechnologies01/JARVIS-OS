@@ -71,6 +71,23 @@ class Event(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class MetaAdsSnapshot(Base):
+    """One scrape result per Ads Power profile per run."""
+    __tablename__ = "meta_ads_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    rdp_host: Mapped[str] = mapped_column(String(50), nullable=False)       # "RDP-1" | "RDP-2"
+    profile_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    profile_name: Mapped[str | None] = mapped_column(String(200))
+    ad_account_id: Mapped[str | None] = mapped_column(String(50))
+    ad_account_name: Mapped[str | None] = mapped_column(String(200))
+    campaigns: Mapped[list] = mapped_column(JSON, default=list)             # list of campaign dicts
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)    # aggregated totals
+    error: Mapped[str | None] = mapped_column(Text)                        # scrape error if any
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Notification(Base):
     __tablename__ = "notifications"
 

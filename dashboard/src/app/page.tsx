@@ -8,6 +8,7 @@ import { VoicePanel } from "@/components/panels/VoicePanel";
 import { IntelligencePanel } from "@/components/panels/IntelligencePanel";
 import { CoolifyPanel } from "@/components/panels/CoolifyPanel";
 import { RDPPanel } from "@/components/panels/RDPPanel";
+import { MetaAdsPanel } from "@/components/panels/MetaAdsPanel";
 import { Header } from "@/components/layout/Header";
 
 export const dynamic = "force-dynamic";
@@ -19,6 +20,11 @@ export default function Dashboard() {
       <Header />
 
       <main className="p-4 lg:p-6 grid grid-cols-12 gap-4 max-w-[1800px] mx-auto">
+        {/* Meta Ads — full width, primary panel */}
+        <div className="col-span-12">
+          <MetaAdsPanel />
+        </div>
+
         {/* Top row: Briefing (wide) + Infra (narrow) */}
         <div className="col-span-12 lg:col-span-8">
           <Suspense fallback={<PanelSkeleton title="Today's Briefing" />}>

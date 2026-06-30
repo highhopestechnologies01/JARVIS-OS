@@ -1,0 +1,7 @@
+{
+  "rdp_host": "RDP-1",
+  "hermes_url": "http://162.35.161.135:8001",
+  "scraper_token": "your_scraper_token_here",
+  "adspower_url": "http://localhost:50325",
+  "max_concurrent_profiles": 3
+}

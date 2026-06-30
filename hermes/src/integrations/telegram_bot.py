@@ -150,6 +150,57 @@ async def _handle_rdp(chat_id: int) -> None:
     await _send(chat_id, "\n".join(lines))
 
 
+async def _handle_ads(chat_id: int) -> None:
+    """Return live Meta Ads summary across all RDP profiles."""
+    await _send(chat_id, "⏳ Fetching Meta Ads data...")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get("http://localhost:8000/api/v1/meta-ads/summary")
+            data = resp.json()
+    except Exception as e:
+        await _send(chat_id, f"❌ Failed to fetch ads data: {e}")
+        return
+
+    if data.get("stale") or data.get("profiles_count", 0) == 0:
+        await _send(chat_id, (
+            "⚠️ <b>No Meta Ads data yet</b>\n\n"
+            "Run the scraper on your RDP machines to start ingesting data."
+        ))
+        return
+
+    lines = [
+        "📊 <b>Meta Ads — Live Summary</b>\n",
+        f"💰 Total Spend: <b>${data['total_spend']:,.2f}</b>",
+        f"👁 Impressions: <b>{data['total_impressions']:,}</b>",
+        f"🖱 Clicks: <b>{data['total_clicks']:,}</b>",
+        f"📈 Avg CTR: <b>{data['avg_ctr']:.2f}%</b>",
+        f"▶️ Active Campaigns: <b>{data['active_campaigns']}</b>",
+        "",
+        "<b>Per Account:</b>",
+    ]
+    for p in data.get("profiles", []):
+        s = p.get("summary", {})
+        name = p.get("ad_account_name") or p.get("profile_name") or p.get("profile_id")
+        spend = s.get("total_spend", 0) or 0
+        impressions = s.get("total_impressions", 0) or 0
+        active = s.get("active_campaigns", 0) or 0
+        err = " ⚠️" if p.get("error") else ""
+        lines.append(f"• <b>{name}</b>{err} [{p['rdp_host']}]\n  ${spend:,.2f} · {impressions:,} impr · {active} active")
+
+    updated = data.get("last_updated", "")
+    if updated:
+        from datetime import datetime, timezone as tz
+        try:
+            dt = datetime.fromisoformat(updated)
+            diff = int((datetime.now(tz.utc) - dt).total_seconds())
+            age = f"{diff // 60}m ago" if diff >= 60 else f"{diff}s ago"
+            lines.append(f"\n<i>Last scraped: {age}</i>")
+        except Exception:
+            pass
+
+    await _send(chat_id, "\n".join(lines))
+
+
 async def _handle_ai(chat_id: int, text: str) -> None:
     """Pass free-text to Claude Haiku and reply."""
     from anthropic import AsyncAnthropic
@@ -177,6 +228,7 @@ HELP_TEXT = """<b>🤖 JARVIS Commands</b>
 /briefing — today's executive briefing
 /memory — last 5 memory entries
 /rdp — RDP machine statuses
+/ads — Meta Ads live summary
 /help — this message
 
 Or just type anything to ask Claude Haiku."""
@@ -221,6 +273,8 @@ async def process_updates() -> None:
             await _handle_memory(chat_id)
         elif cmd == "/rdp":
             await _handle_rdp(chat_id)
+        elif cmd == "/ads":
+            await _handle_ads(chat_id)
         elif cmd in ("/help", "/start"):
             await _send(chat_id, HELP_TEXT)
         else:
