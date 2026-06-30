@@ -38,8 +38,44 @@ def load_config() -> dict:
 
 # ── Ads Power API ─────────────────────────────────────────────────────────────
 
+async def scan_chrome_ports(port_start: int = 50000, port_end: int = 56000) -> list[dict]:
+    """
+    Scan port range for active Chrome CDP endpoints.
+    Returns list of {user_id, name, debug_port} for every live Chrome instance found.
+    This works even when Ads Power API misses profiles.
+    """
+    found = []
+    async with httpx.AsyncClient(timeout=1.5) as client:
+        async def check_port(port: int):
+            try:
+                r = await client.get(f"http://localhost:{port}/json/list")
+                if r.status_code == 200:
+                    tabs = r.json()
+                    if isinstance(tabs, list):
+                        # Prefer ports with Facebook tabs
+                        fb_tabs = [t for t in tabs if "facebook.com" in t.get("url", "")]
+                        return {"user_id": f"port_{port}", "name": f"port_{port}",
+                                "debug_port": str(port), "tabs": tabs, "fb_tabs": len(fb_tabs)}
+            except Exception:
+                pass
+            return None
+
+        tasks = [check_port(p) for p in range(port_start, port_end)]
+        results = await asyncio.gather(*tasks)
+        for r in results:
+            if r:
+                found.append(r)
+
+    # Sort: ports with Facebook tabs first
+    found.sort(key=lambda x: x.get("fb_tabs", 0), reverse=True)
+    print(f"  Port scan found {len(found)} Chrome instances: {[x['debug_port'] for x in found]}")
+    return found
+
 async def get_active_profiles(adspower_url: str) -> list[dict]:
-    """Return profiles that currently have a browser open."""
+    """
+    Get active profiles. Primary: Ads Power API.
+    Fallback: direct port scan to catch profiles the API misses.
+    """
     active = []
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -61,7 +97,22 @@ async def get_active_profiles(adspower_url: str) -> list[dict]:
                         "debug_port": str(data.get("debug_port", "")),
                     })
     except Exception as e:
-        print(f"[ERROR] Ads Power API: {e}")
+        print(f"[WARN] Ads Power API error: {e}")
+
+    # Always supplement with port scan — API often misses open profiles
+    print("Scanning ports for active Chrome instances...")
+    port_results = await scan_chrome_ports()
+
+    # Merge: add port-scan results not already in active list
+    known_ports = {p["debug_port"] for p in active}
+    for pr in port_results:
+        if pr["debug_port"] not in known_ports:
+            active.append({
+                "user_id": pr["user_id"],
+                "name": pr["name"],
+                "debug_port": pr["debug_port"],
+            })
+
     return active
 
 # ── Raw CDP helpers ───────────────────────────────────────────────────────────
