@@ -73,7 +73,7 @@ services:
     env_file:
       - ../.env
     ports:
-      - "127.0.0.1:8001:8000"   # Tailscale-accessible only (bind to loopback)
+      - "0.0.0.0:8001:8000"     # Bind to all interfaces — Tailscale controls access
     networks:
       - jarvis-net
     depends_on:
