@@ -70,18 +70,43 @@ async def scan_chrome_ports(port_start: int = 52000, port_end: int = 54500) -> l
     print(f"  Port scan found {len(found)} Chrome instances: {[x['debug_port'] for x in found]}")
     return found
 
-async def get_active_profiles(adspower_url: str) -> list[dict]:
+async def get_active_profiles(adspower_url: str, fixed_ports: list[int] = None) -> list[dict]:
     """
-    Get active profiles. Primary: Ads Power API.
-    Fallback: direct port scan to catch profiles the API misses.
+    Get active profiles.
+    1. Check fixed_ports from config (explicit, fast, reliable)
+    2. Ads Power API
+    3. Port scan fallback
     """
     active = []
+    known_ports: set[str] = set()
+
+    # ── Fixed ports (highest priority — user-specified from netstat) ──────
+    if fixed_ports:
+        print(f"Checking fixed ports: {fixed_ports}")
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            for port in fixed_ports:
+                try:
+                    r = await client.get(f"http://localhost:{port}/json/list")
+                    if r.status_code == 200:
+                        tabs = r.json()
+                        fb_tabs = [t for t in tabs if "facebook.com" in t.get("url", "")]
+                        port_str = str(port)
+                        active.append({
+                            "user_id": f"port_{port}",
+                            "name": f"port_{port}",
+                            "debug_port": port_str,
+                        })
+                        known_ports.add(port_str)
+                        print(f"  port {port}: {len(tabs)} tabs, {len(fb_tabs)} Facebook tabs")
+                except Exception as e:
+                    print(f"  port {port}: unreachable ({e})")
+
+    # ── Ads Power API ─────────────────────────────────────────────────────
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{adspower_url}/api/v1/user/list",
                                  params={"page": 1, "page_size": 100})
             profiles = r.json().get("data", {}).get("list", [])
-
             for p in profiles:
                 uid = p.get("user_id") or p.get("id")
                 if not uid:
@@ -90,27 +115,28 @@ async def get_active_profiles(adspower_url: str) -> list[dict]:
                                       params={"user_id": uid})
                 data = r2.json().get("data", {})
                 if data.get("status") == "Active":
-                    active.append({
-                        "user_id": uid,
-                        "name": p.get("name", uid),
-                        "debug_port": str(data.get("debug_port", "")),
-                    })
+                    port_str = str(data.get("debug_port", ""))
+                    if port_str and port_str not in known_ports:
+                        active.append({
+                            "user_id": uid,
+                            "name": p.get("name", uid),
+                            "debug_port": port_str,
+                        })
+                        known_ports.add(port_str)
     except Exception as e:
         print(f"[WARN] Ads Power API error: {e}")
 
-    # Always supplement with port scan — API often misses open profiles
-    print("Scanning ports for active Chrome instances...")
-    port_results = await scan_chrome_ports()
-
-    # Merge: add port-scan results not already in active list
-    known_ports = {p["debug_port"] for p in active}
-    for pr in port_results:
-        if pr["debug_port"] not in known_ports:
-            active.append({
-                "user_id": pr["user_id"],
-                "name": pr["name"],
-                "debug_port": pr["debug_port"],
-            })
+    # ── Port scan fallback (if nothing found yet) ─────────────────────────
+    if not active:
+        print("Scanning ports for active Chrome instances...")
+        port_results = await scan_chrome_ports(50000, 58000)
+        for pr in port_results:
+            if pr["debug_port"] not in known_ports:
+                active.append({
+                    "user_id": pr["user_id"],
+                    "name": pr["name"],
+                    "debug_port": pr["debug_port"],
+                })
 
     return active
 
@@ -578,7 +604,8 @@ async def main():
     print(f"=== JARVIS Meta Ads Scraper — {rdp_host} ===")
     print(f"Hermes: {hermes_url}")
 
-    profiles = await get_active_profiles(adspower_url)
+    fixed_ports = config.get("fixed_ports", [])
+    profiles = await get_active_profiles(adspower_url, fixed_ports=fixed_ports)
     if not profiles:
         print("[WARN] No active Ads Power profiles found.")
         return
