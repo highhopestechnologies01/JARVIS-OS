@@ -157,71 +157,53 @@ async def cdp_eval(ws, js: str) -> str | None:
         return json.dumps(v) if not isinstance(v, str) else v
     return None
 
-# ── JS: extract token from page memory (no reload) ───────────────────────────
+# ── JS: extract ALL EAA tokens from page memory ──────────────────────────────
 
-JS_EXTRACT_TOKEN = r"""
+JS_EXTRACT_ALL_TOKENS = r"""
 (function() {
-    // Facebook user access tokens start with EAA and are 100+ chars
-    var pat = /EAA[A-Za-z0-9+\/=_\-]{80,}/;
+    // Collect ALL EAA tokens — we'll try each one via the API
+    var pat = /EAA[A-Za-z0-9+\/=_\-]{50,}/g;
+    var found = new Set();
 
-    function find(str) {
-        if (!str || typeof str !== 'string') return null;
-        var m = str.match(pat);
-        return m ? m[0] : null;
-    }
-
-    // 1. Search all <script> tag contents — most reliable
+    // 1. All <script> tag contents
     var scripts = document.querySelectorAll('script');
     for (var i = 0; i < scripts.length; i++) {
-        var t = find(scripts[i].textContent);
-        if (t) return t;
+        var ms = scripts[i].textContent.match(pat) || [];
+        for (var m of ms) found.add(m);
     }
 
-    // 2. Facebook's internal module system
-    try {
-        var at = require('AccessToken');
-        if (at) {
-            var t = at.getAccessToken ? at.getAccessToken() : (at.accessToken || at.token);
-            if (t && pat.test(t)) return t;
-        }
-    } catch(e) {}
-
-    try {
-        var ue = require('UserAuthData');
-        if (ue && ue.getAccessToken) {
-            var t = ue.getAccessToken();
-            if (t && pat.test(t)) return t;
-        }
-    } catch(e) {}
-
-    // 3. Global window properties
-    var globals = ['__accessToken', 'accessToken', '__FB_TOKEN', '_token', 'FB_TOKEN'];
-    for (var g of globals) {
-        if (window[g] && pat.test(window[g])) return window[g];
-    }
-
-    // 4. Large JSON structures (boot data, relay store)
-    var objs = [
-        window.__FB_DATA, window.__PRELOADED_STATE__, window.__RELAY_BOOTSTRAP_DATA__,
-        window.__RELAY_STORE__, window.AdsManagerBoot, window.__BootloaderConfig
-    ];
-    for (var o of objs) {
+    // 2. Facebook module system
+    var moduleNames = ['AccessToken', 'UserAuthData', 'CurrentUserInitialData'];
+    for (var mn of moduleNames) {
         try {
-            var s = JSON.stringify(o);
-            var t = find(s);
-            if (t) return t;
+            var mod = require(mn);
+            if (mod) {
+                var t = mod.getAccessToken ? mod.getAccessToken() :
+                        mod.access_token || mod.accessToken || mod.token;
+                if (t && /^EAA/.test(t)) found.add(t);
+            }
         } catch(e) {}
     }
 
-    // 5. Search meta tags
-    var metas = document.querySelectorAll('meta');
-    for (var m of metas) {
-        var c = m.getAttribute('content') || '';
-        var t = find(c);
-        if (t) return t;
+    // 3. Window globals
+    var globals = ['__accessToken', 'accessToken', '__FB_TOKEN', '_token', 'FB_TOKEN'];
+    for (var g of globals) {
+        if (window[g] && /^EAA/.test(window[g])) found.add(window[g]);
     }
 
-    return null;
+    // 4. Large JSON structures
+    var objs = [window.__FB_DATA, window.__PRELOADED_STATE__, window.__RELAY_BOOTSTRAP_DATA__,
+                window.__RELAY_STORE__, window.AdsManagerBoot, window.__BootloaderConfig];
+    for (var o of objs) {
+        try {
+            var ms2 = JSON.stringify(o).match(pat) || [];
+            for (var m2 of ms2) found.add(m2);
+        } catch(e) {}
+    }
+
+    // Sort by length desc (longer tokens tend to be more permissioned)
+    var arr = Array.from(found).sort(function(a,b){ return b.length - a.length; });
+    return JSON.stringify(arr);
 })()
 """
 
@@ -335,6 +317,79 @@ JS_TRIGGER_REFRESH = r"""
     return results.join(',') || 'no_trigger';
 })()
 """
+
+# ── Service worker: find its CDP session and intercept real API tokens ────────
+
+async def find_sw_ws_url(debug_port: str) -> str | None:
+    """Find the Ads Manager service worker's CDP WebSocket URL."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"http://localhost:{debug_port}/json/list")
+            targets = r.json()
+            # Look for SW targets for adsmanager.facebook.com
+            for t in targets:
+                ttype = t.get("type", "")
+                url = t.get("url", "")
+                ws = t.get("webSocketDebuggerUrl", "")
+                if ttype == "service_worker" and "adsmanager.facebook.com" in url and ws:
+                    print(f"  Found SW: {url[:70]}")
+                    return ws
+            # Also check worker type
+            for t in targets:
+                ttype = t.get("type", "")
+                url = t.get("url", "")
+                ws = t.get("webSocketDebuggerUrl", "")
+                if ttype == "worker" and "adsmanager" in url and ws:
+                    print(f"  Found worker: {url[:70]}")
+                    return ws
+    except Exception as e:
+        print(f"  [WARN] SW discovery: {e}")
+    return None
+
+
+async def listen_for_graph_token(ws, timeout: float = 30.0) -> str | None:
+    """Listen on a CDP WebSocket for graph.facebook.com requests and extract access_token."""
+    token = None
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            data = json.loads(raw)
+        except asyncio.TimeoutError:
+            continue
+        except Exception:
+            break
+
+        method = data.get("method", "")
+        params = data.get("params", {})
+
+        if method == "Network.requestWillBeSent":
+            url = params.get("request", {}).get("url", "")
+            if "graph.facebook.com" in url:
+                # From URL param
+                if "access_token=" in url:
+                    parsed = urlparse(url)
+                    qs = parse_qs(parsed.query)
+                    if "access_token" in qs:
+                        candidate = qs["access_token"][0]
+                        if len(candidate) > 50:
+                            token = candidate
+                            print(f"  ✓ Token from SW URL param ({len(token)} chars)")
+                            break
+                # From Authorization header
+                headers = params.get("request", {}).get("headers", {})
+                for k, v in headers.items():
+                    if k.lower() == "authorization" and v.startswith("Bearer "):
+                        candidate = v[7:]
+                        if len(candidate) > 50:
+                            token = candidate
+                            print(f"  ✓ Token from SW Authorization header ({len(token)} chars)")
+                            break
+                if token:
+                    break
+
+    return token
+
 
 # ── Meta Marketing API ────────────────────────────────────────────────────────
 
@@ -555,88 +610,128 @@ async def scrape_profile(profile: dict) -> dict:
         current_url = ads_tab.get("url", "")
         print(f"  Connecting to tab: {current_url[:80]}")
 
-        async with websockets.connect(ws_url, ping_interval=None, open_timeout=15, close_timeout=5) as ws:
-            await cdp_send(ws, "Runtime.enable")
+        # Extract account ID from URL (used for direct API fallback)
+        account_ids_from_url = re.findall(r'act[_=](\d+)', current_url)
+        if account_ids_from_url:
+            print(f"  Account ID from URL: {account_ids_from_url}")
 
-            # Extract account ID from URL (used for direct API fallback)
-            account_ids_from_url = re.findall(r'act[_=](\d+)', current_url)
-            if account_ids_from_url:
-                print(f"  Account ID from URL: {account_ids_from_url}")
+        token = None
 
-            # ── Strategy 1: Extract token from page memory (NO reload) ────
-            print("  Searching page memory for access token...")
-            token = await cdp_eval(ws, JS_EXTRACT_TOKEN)
-            if token and len(token) > 30 and token.startswith("EAA"):
-                print(f"  ✓ Token found in page memory ({len(token)} chars)")
-            else:
-                token = None
+        # ── Strategy 1: Service worker CDP interception ───────────────────
+        # The SW (www-service-worker.js) is what actually calls graph.facebook.com
+        # with real auth. Connect to SW's CDP, enable Network events, trigger
+        # a page UI action, and capture the token from SW network events.
+        sw_ws_url = await find_sw_ws_url(debug_port)
 
-            if not token:
-                print("  Token not in page memory — installing fetch override + triggering UI...")
+        if sw_ws_url:
+            print("  Connecting to service worker CDP session...")
+            try:
+                async with websockets.connect(
+                    sw_ws_url, ping_interval=None, open_timeout=10, close_timeout=3
+                ) as sw_ws:
+                    await cdp_send(sw_ws, "Network.enable")
+                    print("  SW network monitoring active. Triggering UI to force API call...")
 
-                # ── Strategy 2: Install override + trigger UI refresh ─────
+                    # Connect to page and trigger UI refresh concurrently
+                    async def trigger_page():
+                        await asyncio.sleep(0.5)
+                        try:
+                            async with websockets.connect(
+                                ws_url, ping_interval=None, open_timeout=10, close_timeout=3
+                            ) as pw:
+                                await cdp_send(pw, "Runtime.enable")
+                                r = await cdp_eval(pw, JS_TRIGGER_REFRESH)
+                                print(f"  Page trigger: {r}")
+                                # Also install JS override on page for its own calls
+                                await cdp_eval(pw, JS_INSTALL_OVERRIDE)
+                        except Exception as te:
+                            print(f"  Page trigger error: {te}")
+
+                    trigger_task = asyncio.create_task(trigger_page())
+                    token = await listen_for_graph_token(sw_ws, timeout=30.0)
+                    await asyncio.gather(trigger_task, return_exceptions=True)
+
+            except Exception as e:
+                print(f"  SW connection failed: {e}")
+
+        # ── Strategy 2: Page JS override + page Network events ────────────
+        # If SW interception didn't work, try from the page context
+        if not token:
+            print("  SW interception failed — trying page-level capture...")
+            async with websockets.connect(
+                ws_url, ping_interval=None, open_timeout=15, close_timeout=5
+            ) as ws:
+                await cdp_send(ws, "Runtime.enable")
+                await cdp_send(ws, "Network.enable")
                 await cdp_eval(ws, JS_INSTALL_OVERRIDE)
-                trigger_result = await cdp_eval(ws, JS_TRIGGER_REFRESH)
-                print(f"  Trigger result: {trigger_result}")
 
-                # Wait up to 20s for triggered API calls to fire
-                deadline = asyncio.get_event_loop().time() + 20.0
+                trigger_result = await cdp_eval(ws, JS_TRIGGER_REFRESH)
+                print(f"  Page trigger: {trigger_result}")
+
+                deadline = asyncio.get_event_loop().time() + 25.0
                 while asyncio.get_event_loop().time() < deadline:
-                    await asyncio.sleep(1.0)
-                    captured = await cdp_eval(ws, "window.__jarvis_captured_token || ''")
-                    if captured and len(captured) > 30:
-                        token = captured
-                        print(f"  ✓ Token captured via fetch override ({len(token)} chars)")
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        data = json.loads(raw)
+                    except asyncio.TimeoutError:
+                        captured = await cdp_eval(ws, "window.__jarvis_captured_token || ''")
+                        if captured and len(captured) > 50:
+                            token = captured
+                            print(f"  ✓ Token via JS override ({len(token)} chars)")
+                            break
+                        continue
+                    except Exception:
                         break
 
-                # ── Strategy 3: Listen for CDP Network events (30s) ──────
-                if not token:
-                    print("  Listening for CDP network events (30s)...")
-                    await cdp_send(ws, "Network.enable")
-
-                    deadline = asyncio.get_event_loop().time() + 30.0
-                    while asyncio.get_event_loop().time() < deadline:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                            data = json.loads(raw)
-                        except asyncio.TimeoutError:
-                            # Poll JS override periodically
-                            captured = await cdp_eval(ws, "window.__jarvis_captured_token || ''")
-                            if captured and len(captured) > 30:
-                                token = captured
-                                print(f"  ✓ Token captured from network event ({len(token)} chars)")
-                                break
-                            continue
-                        except Exception:
-                            break
-
-                        method = data.get("method", "")
-                        params = data.get("params", {})
-
-                        if method == "Network.requestWillBeSent":
-                            url = params.get("request", {}).get("url", "")
-                            if "graph.facebook.com" in url:
-                                if "access_token=" in url:
-                                    parsed = urlparse(url)
-                                    qs = parse_qs(parsed.query)
-                                    if "access_token" in qs:
-                                        token = qs["access_token"][0]
-                                        print(f"  ✓ Token from Network event ({len(token)} chars)")
-                                        break
-                                hdrs = params.get("request", {}).get("headers", {})
-                                for k, v in hdrs.items():
-                                    if k.lower() == "authorization" and v.startswith("Bearer "):
-                                        t = v[7:]
-                                        if len(t) > 30:
-                                            token = t
-                                            print(f"  ✓ Token from Authorization header ({len(t)} chars)")
-                                            break
-                                if token:
+                    method = data.get("method", "")
+                    params = data.get("params", {})
+                    if method == "Network.requestWillBeSent":
+                        url = params.get("request", {}).get("url", "")
+                        if "graph.facebook.com" in url and "access_token=" in url:
+                            parsed = urlparse(url)
+                            qs = parse_qs(parsed.query)
+                            if "access_token" in qs:
+                                candidate = qs["access_token"][0]
+                                if len(candidate) > 50:
+                                    token = candidate
+                                    print(f"  ✓ Token from page Network event ({len(token)} chars)")
                                     break
 
-            # ── Use token with Meta Marketing API ─────────────────────────
-            if token:
-                api_data = await fetch_via_meta_api(token, known_account_ids=account_ids_from_url)
+        # ── Strategy 3: Try ALL EAA tokens from page memory ──────────────
+        # The script-tag tokens are SDK/client tokens (code 1 error) but
+        # there might be more — try all of them with a quick /me check
+        if not token:
+            print("  Trying all EAA tokens from page memory...")
+            async with websockets.connect(
+                ws_url, ping_interval=None, open_timeout=15, close_timeout=5
+            ) as ws:
+                await cdp_send(ws, "Runtime.enable")
+                raw_tokens = await cdp_eval(ws, JS_EXTRACT_ALL_TOKENS)
+                if raw_tokens:
+                    try:
+                        all_tokens = json.loads(raw_tokens)
+                        print(f"  Found {len(all_tokens)} EAA tokens: {[t[:15]+'...' for t in all_tokens[:5]]}")
+                        async with httpx.AsyncClient(timeout=10.0) as hclient:
+                            for t in all_tokens:
+                                me_r = await hclient.get(
+                                    "https://graph.facebook.com/v19.0/me",
+                                    params={"access_token": t, "fields": "id,name"},
+                                )
+                                me_data = me_r.json()
+                                if "error" not in me_data:
+                                    token = t
+                                    print(f"  ✓ Valid user token found: {me_data.get('name')} ({len(t)} chars)")
+                                    break
+                                else:
+                                    code = me_data.get("error", {}).get("code")
+                                    if code != 1:  # Code 1 = invalid; other codes = different issue
+                                        print(f"  Token {t[:20]}... → code {code} (might be valid with right perms)")
+                    except Exception as e:
+                        print(f"  Token scan error: {e}")
+
+        # ── Use token with Meta Marketing API ─────────────────────────────
+        if token:
+            api_data = await fetch_via_meta_api(token, known_account_ids=account_ids_from_url)
                 if api_data:
                     all_campaigns = []
                     total_spend = total_impr = total_clicks = active = 0
