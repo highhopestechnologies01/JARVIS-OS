@@ -71,7 +71,7 @@ metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
 # Routes
-app.include_router(health.router, tags=["health"])
+app.include_router(health.router, prefix="/api/v1", tags=["health"])
 app.include_router(briefings.router, prefix="/api/v1/briefings", tags=["briefings"])
 app.include_router(memory.router, prefix="/api/v1/memory", tags=["memory"])
 app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["tasks"])
