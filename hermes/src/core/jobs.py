@@ -78,10 +78,10 @@ async def infrastructure_health_check():
     log.info("jobs.health_check.start")
 
     # Use Docker internal hostnames — Hermes checks itself via localhost
-    # n8n container is named jarvis-n8n on jarvis-net
+    # n8n is Coolify-managed (n8n-n8n-1) connected to jarvis-net
     services = {
         "hermes":     "http://localhost:8000/api/v1/health/ready",
-        "n8n":        "http://jarvis-n8n:5678/healthz",
+        "n8n":        "http://n8n-n8n-1:5678/healthz",
         "grafana":    "http://jarvis-grafana:3000/api/health",
         "prometheus": "http://jarvis-prometheus:9090/-/healthy",
     }
@@ -119,6 +119,17 @@ async def infrastructure_health_check():
         alert = "⚠️ JARVIS Health Alert:\n" + "\n".join(f"• {f}" for f in failures)
         await dispatcher.send_sms(alert)
         log.warning("jobs.health_check.failures", failures=failures)
+
+        # POST to n8n health alert workflow (non-blocking — failure here is OK)
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as n8n_client:
+                await n8n_client.post(
+                    "http://n8n-n8n-1:5678/webhook/jarvis-health-alert",
+                    json={"failures": failures, "statuses": statuses},
+                )
+            log.info("jobs.health_check.n8n_alert_sent")
+        except Exception as e:
+            log.warning("jobs.health_check.n8n_alert_failed", error=str(e))
     else:
         log.info("jobs.health_check.all_ok", checked=len(services))
 
