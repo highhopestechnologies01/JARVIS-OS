@@ -3,11 +3,12 @@ JARVIS Meta Ads Scraper — runs on RDP machines (Windows).
 
 Strategy:
   1. Query Ads Power local API for active browser profiles
-  2. For each profile: get CDP debug port, find/open Ads Manager tab
-  3. Use raw CDP websockets (no Playwright — version-agnostic)
-  4. Navigate to Ads Manager, extract campaign data via JS evaluation
-  5. Fallback: intercept graph.facebook.com for access token → Marketing API
-  6. POST results to Hermes
+  2. For each profile: get CDP debug port, find Ads Manager tab
+  3. Use raw CDP websockets — enable Network domain, reload page
+  4. Intercept graph.facebook.com requests to capture access_token
+  5. Call Meta Marketing API with captured token for clean data
+  6. Fallback: DOM scrape with broad selectors
+  7. POST results to Hermes
 
 Run every 5 minutes via Windows Task Scheduler.
 Configure via config.json in this directory.
@@ -66,14 +67,8 @@ async def get_active_profiles(adspower_url: str) -> list[dict]:
 # ── Raw CDP helpers ───────────────────────────────────────────────────────────
 
 async def cdp_get_tabs(debug_port: str) -> list[dict]:
-    """Get all open tabs via Chrome's REST debug API."""
     async with httpx.AsyncClient(timeout=5.0) as client:
         r = await client.get(f"http://localhost:{debug_port}/json/list")
-        return r.json()
-
-async def cdp_new_tab(debug_port: str, url: str) -> dict:
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        r = await client.get(f"http://localhost:{debug_port}/json/new?{url}")
         return r.json()
 
 async def cdp_close_tab(debug_port: str, tab_id: str) -> None:
@@ -88,11 +83,10 @@ def _next_id() -> int:
     return _cmd_id
 
 async def cdp_send(ws, method: str, params: dict = None) -> dict:
-    """Send one CDP command and wait for its response."""
+    """Send one CDP command and wait for its response (ignores events)."""
     cmd_id = _next_id()
     msg = {"id": cmd_id, "method": method, "params": params or {}}
     await ws.send(json.dumps(msg))
-    # Read messages until we get the matching response
     deadline = asyncio.get_event_loop().time() + 30.0
     while asyncio.get_event_loop().time() < deadline:
         try:
@@ -107,7 +101,6 @@ async def cdp_send(ws, method: str, params: dict = None) -> dict:
     return {}
 
 async def cdp_evaluate(ws, expression: str) -> str | None:
-    """Evaluate JS expression in the page, return string result."""
     result = await cdp_send(ws, "Runtime.evaluate", {
         "expression": expression,
         "returnByValue": True,
@@ -121,89 +114,133 @@ async def cdp_evaluate(ws, expression: str) -> str | None:
         return json.dumps(val["value"])
     return None
 
-async def cdp_navigate_and_wait(ws, url: str, wait_s: float = 8.0) -> None:
-    """Navigate to URL, wait for load."""
-    await cdp_send(ws, "Page.enable")
-    await cdp_send(ws, "Page.navigate", {"url": url})
-    await asyncio.sleep(wait_s)  # wait for page to render
+# ── CDP Network interception for access token ─────────────────────────────────
 
-# ── DOM extraction JS ─────────────────────────────────────────────────────────
+async def intercept_access_token(ws, reload: bool = True, timeout: float = 25.0) -> str | None:
+    """
+    Enable CDP Network domain, optionally reload the page, then listen for
+    outgoing requests to graph.facebook.com and extract the access_token.
+    Returns the token string or None.
+    """
+    await cdp_send(ws, "Network.enable")
+    await cdp_send(ws, "Page.enable")
+
+    token = None
+
+    if reload:
+        # Fire page reload — don't await via cdp_send because we need to
+        # stream events concurrently
+        reload_id = _next_id()
+        await ws.send(json.dumps({"id": reload_id, "method": "Page.reload", "params": {}}))
+        print("    Reloading page to intercept API calls...")
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            data = json.loads(raw)
+        except asyncio.TimeoutError:
+            continue
+        except Exception:
+            break
+
+        method = data.get("method", "")
+        params = data.get("params", {})
+
+        # ── requestWillBeSent: check URL for access_token param ──────────
+        if method == "Network.requestWillBeSent":
+            url = params.get("request", {}).get("url", "")
+            if "graph.facebook.com" in url and "access_token=" in url:
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                if "access_token" in qs:
+                    token = qs["access_token"][0]
+                    print(f"    Token captured from URL param ({len(token)} chars)")
+                    break
+
+            # Check request headers for Authorization: Bearer <token>
+            headers = params.get("request", {}).get("headers", {})
+            for k, v in headers.items():
+                if k.lower() == "authorization" and v.startswith("Bearer "):
+                    candidate = v[7:]
+                    if len(candidate) > 30:
+                        token = candidate
+                        print(f"    Token captured from Authorization header ({len(token)} chars)")
+                        break
+            if token:
+                break
+
+        # ── responseReceived: look for graph.facebook.com responses ──────
+        if method == "Network.responseReceived":
+            url = params.get("response", {}).get("url", "")
+            if "graph.facebook.com" in url:
+                # Token should have appeared in a prior requestWillBeSent
+                pass
+
+        # Stop listening once page fully loaded (if we still have no token, keep going)
+        if method == "Page.loadEventFired" and token:
+            break
+
+    return token
+
+# ── DOM extraction JS (broad selectors for Meta Ads Manager) ──────────────────
 
 DOM_EXTRACT_JS = r"""
 (function() {
     try {
-        var table = document.querySelector('table') ||
-                    document.querySelector('[role="grid"]') ||
-                    document.querySelector('[data-testid*="campaign"]');
-        if (!table) return JSON.stringify({found: false, campaigns: [], headers: []});
+        // Meta Ads Manager uses role="row" heavily inside a custom grid
+        var rows = Array.from(document.querySelectorAll('[role="row"]'));
 
-        var headerEls = table.querySelectorAll('th, [role="columnheader"]');
-        var headers = Array.from(headerEls).map(function(h) {
-            return h.innerText.trim().toLowerCase().replace(/\s+/g, '_');
+        // Filter to rows that look like data rows (have multiple cells)
+        var dataRows = rows.filter(function(r) {
+            return r.querySelectorAll('[role="cell"], [role="gridcell"]').length >= 3;
         });
 
-        var rows = Array.from(
-            table.querySelectorAll('tbody tr, [role="row"]:not(:first-child)')
-        ).filter(function(r) {
-            return r.querySelectorAll('td, [role="cell"]').length > 2;
-        });
-
-        var campaigns = rows.map(function(row) {
-            var cells = Array.from(row.querySelectorAll('td, [role="cell"]'));
-            var obj = {};
-            headers.forEach(function(h, i) {
-                if (cells[i]) obj[h] = cells[i].innerText.trim();
-            });
-            if (Object.keys(obj).length === 0) {
-                var raw = cells.map(function(c) { return c.innerText.trim(); });
-                obj = {name: raw[0]||'', status: raw[1]||'', budget: raw[2]||'',
-                       impressions: raw[5]||'', spend: raw[raw.length-1]||''};
+        if (dataRows.length === 0) {
+            // Broader: any div that has spend data
+            var spendEls = document.querySelectorAll('[data-column-id], [data-cell-id]');
+            if (spendEls.length === 0) {
+                return JSON.stringify({
+                    found: false,
+                    url: window.location.href,
+                    title: document.title,
+                    bodySnippet: document.body ? document.body.innerText.slice(0, 500) : ''
+                });
             }
-            return obj;
-        }).filter(function(c) { return c.name; });
+        }
 
-        var urlMatch = window.location.href.match(/act_?(\d+)/);
-        var accountEl = document.querySelector('[aria-label*="account"], [data-testid*="account"]');
+        var campaigns = dataRows.map(function(row) {
+            var cells = Array.from(row.querySelectorAll('[role="cell"], [role="gridcell"], td'));
+            var texts = cells.map(function(c) { return c.innerText.trim(); });
+            return {
+                name: texts[0] || '',
+                status: texts[1] || '',
+                budget: texts[2] || '',
+                impressions: texts[4] || '',
+                clicks: texts[5] || '',
+                ctr: texts[6] || '',
+                cpc: texts[7] || '',
+                spend: texts[texts.length - 1] || '',
+            };
+        }).filter(function(c) { return c.name && c.name.length > 1; });
 
+        var urlMatch = window.location.href.match(/act[_=](\d+)/);
         return JSON.stringify({
-            found: true,
+            found: campaigns.length > 0,
             campaigns: campaigns,
-            headers: headers,
             accountId: urlMatch ? urlMatch[1] : null,
-            accountName: accountEl ? accountEl.innerText.trim() : document.title,
-            url: window.location.href
+            accountName: document.title,
+            url: window.location.href,
         });
     } catch(e) {
-        return JSON.stringify({found: false, error: e.message, campaigns: []});
+        return JSON.stringify({found: false, error: e.message, url: window.location.href});
     }
-})()
-"""
-
-TOKEN_EXTRACT_JS = r"""
-(function() {
-    // Try to find access token in page JS globals
-    try {
-        if (window.__accessToken) return window.__accessToken;
-        if (window.require) {
-            try { var s = window.require('SessionToken'); if(s&&s.getToken) return s.getToken(); } catch(e) {}
-        }
-        // Check localStorage/sessionStorage for token hints
-        for (var i = 0; i < localStorage.length; i++) {
-            var k = localStorage.key(i);
-            if (k && k.toLowerCase().includes('token')) {
-                var v = localStorage.getItem(k);
-                if (v && v.length > 20 && !v.startsWith('{')) return v;
-            }
-        }
-    } catch(e) {}
-    return null;
 })()
 """
 
 # ── Meta Marketing API ────────────────────────────────────────────────────────
 
 async def fetch_via_meta_api(token: str) -> list[dict]:
-    """Use intercepted token to query Meta Marketing API."""
     results = []
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -211,7 +248,15 @@ async def fetch_via_meta_api(token: str) -> list[dict]:
                 "https://graph.facebook.com/v19.0/me/adaccounts",
                 params={"access_token": token, "fields": "id,name,account_status", "limit": 100},
             )
+            if r.status_code != 200:
+                print(f"    Meta API accounts error: {r.status_code} {r.text[:100]}")
+                return []
             accounts = r.json().get("data", [])
+            if not accounts:
+                print("    Meta API: no ad accounts returned")
+                return []
+
+            print(f"    Meta API: {len(accounts)} ad accounts")
             for account in accounts:
                 aid = account["id"]
                 account_name = account.get("name", aid)
@@ -227,29 +272,41 @@ async def fetch_via_meta_api(token: str) -> list[dict]:
                 insights_data = insights_r.json().get("data", [])
 
                 campaigns = []
-                total_spend = total_impr = total_clicks = active_count = 0
+                total_spend = total_impr = total_clicks = 0
                 for ins in insights_data:
                     spend = float(ins.get("spend", 0))
                     impressions = int(ins.get("impressions", 0))
                     clicks = int(ins.get("clicks", 0))
-                    total_spend += spend; total_impr += impressions; total_clicks += clicks
+                    total_spend += spend
+                    total_impr += impressions
+                    total_clicks += clicks
                     campaigns.append({
                         "name": ins.get("campaign_name", ""),
-                        "status": "ACTIVE", "spend": f"${spend:.2f}",
-                        "impressions": str(impressions), "clicks": str(clicks),
-                        "ctr": ins.get("ctr", ""), "cpm": ins.get("cpm", ""),
-                        "cpc": ins.get("cpc", ""), "reach": ins.get("reach", ""),
+                        "status": "ACTIVE",
+                        "spend": f"${spend:.2f}",
+                        "impressions": str(impressions),
+                        "clicks": str(clicks),
+                        "ctr": ins.get("ctr", ""),
+                        "cpm": ins.get("cpm", ""),
+                        "cpc": ins.get("cpc", ""),
+                        "reach": ins.get("reach", ""),
                     })
 
                 avg_ctr = round(total_clicks / total_impr * 100, 2) if total_impr > 0 else 0
                 results.append({
-                    "account_id": aid, "account_name": account_name,
+                    "account_id": aid,
+                    "account_name": account_name,
                     "campaigns": campaigns,
-                    "summary": {"total_spend": round(total_spend, 2), "total_impressions": total_impr,
-                                "total_clicks": total_clicks, "active_campaigns": len(campaigns), "avg_ctr": avg_ctr},
+                    "summary": {
+                        "total_spend": round(total_spend, 2),
+                        "total_impressions": total_impr,
+                        "total_clicks": total_clicks,
+                        "active_campaigns": len(campaigns),
+                        "avg_ctr": avg_ctr,
+                    },
                 })
     except Exception as e:
-        print(f"[ERROR] Meta API: {e}")
+        print(f"    [ERROR] Meta API: {e}")
     return results
 
 # ── DOM campaign parser ───────────────────────────────────────────────────────
@@ -258,30 +315,43 @@ def parse_dom_campaigns(raw: list[dict]) -> tuple[list[dict], dict]:
     campaigns = []
     total_spend = total_impr = total_clicks = active_count = 0
     for c in raw:
-        name = c.get("campaign_name") or c.get("campaign") or c.get("name", "")
-        status = c.get("delivery") or c.get("status", "")
-        spend_str = c.get("amount_spent") or c.get("spend", "")
+        name = c.get("name", "")
+        status = c.get("status", "")
+        spend_str = c.get("spend", "")
         impressions_str = c.get("impressions", "")
-        clicks_str = c.get("link_clicks") or c.get("clicks", "")
+        clicks_str = c.get("clicks", "")
 
         def parse_num(s):
             s = re.sub(r"[^\d.]", "", str(s)) if s else ""
-            try: return float(s) if "." in s else int(s)
-            except: return 0
+            try:
+                return float(s) if "." in s else int(s)
+            except:
+                return 0
 
         spend_val = float(parse_num(spend_str))
         impr_val = int(parse_num(impressions_str))
         clicks_val = int(parse_num(clicks_str))
-        total_spend += spend_val; total_impr += impr_val; total_clicks += clicks_val
+        total_spend += spend_val
+        total_impr += impr_val
+        total_clicks += clicks_val
         if "active" in status.lower() or "delivering" in status.lower():
             active_count += 1
-        campaigns.append({"name": name, "status": status, "budget": c.get("budget", ""),
-                          "spend": spend_str, "impressions": impressions_str, "clicks": clicks_str,
-                          "ctr": c.get("ctr", ""), "cpm": c.get("cpm", ""), "cpc": c.get("cpc", "")})
+        campaigns.append({
+            "name": name, "status": status,
+            "budget": c.get("budget", ""),
+            "spend": spend_str, "impressions": impressions_str,
+            "clicks": clicks_str, "ctr": c.get("ctr", ""),
+            "cpm": c.get("cpm", ""), "cpc": c.get("cpc", ""),
+        })
 
     avg_ctr = round(total_clicks / total_impr * 100, 2) if total_impr > 0 else 0
-    return campaigns, {"total_spend": round(total_spend, 2), "total_impressions": total_impr,
-                       "total_clicks": total_clicks, "active_campaigns": active_count, "avg_ctr": avg_ctr}
+    return campaigns, {
+        "total_spend": round(total_spend, 2),
+        "total_impressions": total_impr,
+        "total_clicks": total_clicks,
+        "active_campaigns": active_count,
+        "avg_ctr": avg_ctr,
+    }
 
 # ── Profile scraper ───────────────────────────────────────────────────────────
 
@@ -290,7 +360,7 @@ async def scrape_profile(profile: dict) -> dict:
     name = profile["name"]
     debug_port = profile["debug_port"]
 
-    print(f"[{name}] Scraping (debug port {debug_port})...")
+    print(f"\n[{name}] Scraping (port {debug_port})...")
 
     result = {
         "profile_id": uid, "profile_name": name,
@@ -299,80 +369,89 @@ async def scrape_profile(profile: dict) -> dict:
     }
 
     try:
-        # ── Step 1: get open tabs ──────────────────────────────────────────
         tabs = await cdp_get_tabs(debug_port)
-        print(f"[{name}] {len(tabs)} tabs open")
+        print(f"  {len(tabs)} tabs open")
 
-        # Find existing Ads Manager tab or create one
+        # ── Find best tab to use ──────────────────────────────────────────
         ads_tab = None
+        # Prefer existing Ads Manager tab
         for t in tabs:
             if "adsmanager.facebook.com" in t.get("url", ""):
                 ads_tab = t
+                print(f"  Found Ads Manager tab: {t.get('url','')[:60]}")
                 break
 
-        opened_new = False
+        # Fall back to any Facebook tab
         if not ads_tab:
-            print(f"[{name}] No Ads Manager tab — looking for blank tab to reuse")
-            # 1) reuse existing blank/newtab tab
+            for t in tabs:
+                if "facebook.com" in t.get("url", ""):
+                    ads_tab = t
+                    print(f"  Using Facebook tab: {t.get('url','')[:60]}")
+                    break
+
+        # Fall back to blank tab
+        if not ads_tab:
             for t in tabs:
                 u = t.get("url", "")
                 if u in ("about:blank", "chrome://newtab/", "") or "newtab" in u:
                     ads_tab = t
-                    opened_new = True
+                    print("  Using blank tab")
                     break
 
-            # 2) try /json/new (some Chrome builds support it)
-            if not ads_tab:
-                try:
-                    async with httpx.AsyncClient(timeout=5.0) as _c:
-                        _r = await _c.get(f"http://localhost:{debug_port}/json/new")
-                        if _r.text.strip():
-                            ads_tab = _r.json()
-                            opened_new = True
-                except Exception:
-                    pass
-
-            # 3) fall back to first tab and navigate it
-            if not ads_tab and tabs:
-                ads_tab = tabs[0]
-                opened_new = False  # don't close — it was pre-existing
+        # Last resort: first tab
+        if not ads_tab and tabs:
+            ads_tab = tabs[0]
+            print(f"  Using first tab: {ads_tab.get('url','')[:60]}")
 
         if not ads_tab:
-            result["error"] = "No usable tab found"
+            result["error"] = "No tabs available"
             return result
 
         ws_url = ads_tab.get("webSocketDebuggerUrl")
         if not ws_url:
-            result["error"] = "No webSocketDebuggerUrl in tab"
+            result["error"] = "No webSocketDebuggerUrl"
             return result
 
-        print(f"[{name}] Connecting to tab via CDP WS...")
+        print(f"  Connecting via CDP WS...")
 
-        # ── Step 2: connect raw CDP ────────────────────────────────────────
         async with websockets.connect(
             ws_url,
             ping_interval=None,
             open_timeout=15,
             close_timeout=5,
         ) as ws:
-            # Enable domains
             await cdp_send(ws, "Runtime.enable")
-            await cdp_send(ws, "Page.enable")
 
-            # Navigate if needed
             current_url = ads_tab.get("url", "")
-            if "adsmanager.facebook.com" not in current_url:
-                print(f"[{name}] Navigating to Ads Manager...")
-                await cdp_navigate_and_wait(ws, "https://adsmanager.facebook.com/adsmanager/manage/campaigns", wait_s=10)
-            else:
-                print(f"[{name}] Ads Manager already open — extracting data")
-                await asyncio.sleep(2)  # brief settle
 
-            # ── Step 3: try token extraction ──────────────────────────────
-            token_raw = await cdp_evaluate(ws, TOKEN_EXTRACT_JS)
-            if token_raw and len(token_raw) > 30:
-                print(f"[{name}] Token found — calling Meta API")
-                api_data = await fetch_via_meta_api(token_raw)
+            # ── Strategy 1: Network interception for access token ─────────
+            # If already on Ads Manager, reload to intercept API calls.
+            # If on other FB page, navigate to Ads Manager first.
+            if "adsmanager.facebook.com" in current_url:
+                print("  Intercepting network: reloading Ads Manager...")
+                token = await intercept_access_token(ws, reload=True, timeout=30.0)
+            elif "facebook.com" in current_url:
+                print("  Navigating to Ads Manager for interception...")
+                await cdp_send(ws, "Page.enable")
+                nav_id = _next_id()
+                await ws.send(json.dumps({
+                    "id": nav_id, "method": "Page.navigate",
+                    "params": {"url": "https://adsmanager.facebook.com/adsmanager/manage/campaigns"}
+                }))
+                token = await intercept_access_token(ws, reload=False, timeout=30.0)
+            else:
+                print("  Navigating non-FB tab to Ads Manager...")
+                await cdp_send(ws, "Page.enable")
+                nav_id = _next_id()
+                await ws.send(json.dumps({
+                    "id": nav_id, "method": "Page.navigate",
+                    "params": {"url": "https://adsmanager.facebook.com/adsmanager/manage/campaigns"}
+                }))
+                token = await intercept_access_token(ws, reload=False, timeout=30.0)
+
+            if token:
+                print(f"  Token captured — querying Meta Marketing API...")
+                api_data = await fetch_via_meta_api(token)
                 if api_data:
                     all_campaigns = []
                     total_spend = total_impr = total_clicks = active = 0
@@ -387,29 +466,33 @@ async def scrape_profile(profile: dict) -> dict:
 
                     result["campaigns"] = all_campaigns
                     result["summary"] = {
-                        "total_spend": round(total_spend, 2), "total_impressions": total_impr,
-                        "total_clicks": total_clicks, "active_campaigns": active,
+                        "total_spend": round(total_spend, 2),
+                        "total_impressions": total_impr,
+                        "total_clicks": total_clicks,
+                        "active_campaigns": active,
                         "avg_ctr": round(total_clicks / total_impr * 100, 2) if total_impr > 0 else 0,
                     }
-                    result["ad_account_name"] = api_data[0]["account_name"] if len(api_data) == 1 else f"{len(api_data)} accounts"
+                    result["ad_account_name"] = (
+                        api_data[0]["account_name"] if len(api_data) == 1
+                        else f"{len(api_data)} accounts"
+                    )
                     result["ad_account_id"] = api_data[0]["account_id"] if len(api_data) == 1 else None
-                    print(f"[{name}] API: {len(all_campaigns)} campaigns, ${total_spend:.2f} spend")
-                    if opened_new:
-                        await cdp_close_tab(debug_port, ads_tab.get("id", ""))
+                    print(f"  ✓ {len(all_campaigns)} campaigns, ${total_spend:.2f} total spend")
                     return result
+                else:
+                    print("  Meta API returned no data — falling back to DOM")
+            else:
+                print("  No token intercepted — trying DOM scrape")
 
-            # ── Step 4: DOM scrape fallback ───────────────────────────────
-            print(f"[{name}] DOM scraping...")
+            # ── Strategy 2: DOM scrape (wait for page to settle) ──────────
+            await asyncio.sleep(5)
             dom_raw = await cdp_evaluate(ws, DOM_EXTRACT_JS)
-
-            if opened_new:
-                await cdp_close_tab(debug_port, ads_tab.get("id", ""))
 
             if dom_raw:
                 try:
                     dom = json.loads(dom_raw)
                 except Exception:
-                    dom = {"found": False, "campaigns": []}
+                    dom = {"found": False}
 
                 if dom.get("found"):
                     result["ad_account_id"] = dom.get("accountId")
@@ -417,17 +500,19 @@ async def scrape_profile(profile: dict) -> dict:
                     campaigns, summary = parse_dom_campaigns(dom.get("campaigns", []))
                     result["campaigns"] = campaigns
                     result["summary"] = summary
-                    print(f"[{name}] DOM: {len(campaigns)} campaigns")
+                    print(f"  DOM: {len(campaigns)} campaigns")
                 else:
-                    err = dom.get("error", "table not found")
-                    result["error"] = f"DOM: {err}"
-                    print(f"[{name}] DOM failed: {err}")
+                    snippet = dom.get("bodySnippet", "")[:100]
+                    url = dom.get("url", "")
+                    result["error"] = f"DOM: no table. URL={url} Page={snippet}"
+                    print(f"  DOM failed — URL: {url}")
+                    print(f"  Page snippet: {snippet}")
             else:
                 result["error"] = "Empty DOM result"
 
     except Exception as e:
         result["error"] = str(e)
-        print(f"[{name}] ERROR: {e}")
+        print(f"  ERROR: {e}")
         traceback.print_exc()
 
     return result
@@ -471,13 +556,17 @@ async def main():
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{hermes_url}/api/v1/meta-ads/ingest", json=payload, headers=headers)
+            r = await client.post(
+                f"{hermes_url}/api/v1/meta-ads/ingest",
+                json=payload,
+                headers=headers,
+            )
             if r.status_code == 200:
-                print(f"✓ Ingested {r.json().get('profiles_ingested')} profiles into Hermes")
+                print(f"\n✓ Ingested {r.json().get('profiles_ingested')} profiles into Hermes")
             else:
-                print(f"✗ Hermes ingest failed: HTTP {r.status_code} — {r.text[:200]}")
+                print(f"\n✗ Hermes ingest failed: HTTP {r.status_code} — {r.text[:200]}")
     except Exception as e:
-        print(f"✗ Failed to POST to Hermes: {e}")
+        print(f"\n✗ Failed to POST to Hermes: {e}")
 
     print("=== Done ===")
 
