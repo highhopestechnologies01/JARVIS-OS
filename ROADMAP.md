@@ -137,6 +137,21 @@ Mac environment fully configured.
 
 ---
 
+## Coolify Integration ✅ COMPLETE
+
+**Completed: 2026-06-30**
+
+- [x] Coolify API token generated (Laravel Sanctum, team_id=0)
+- [x] `hermes/src/integrations/coolify.py` — full async Coolify v4 API client
+- [x] `hermes/src/api/routes/coolify.py` — GET /api/v1/coolify/status, POST /services/{uuid}/restart
+- [x] Coolify accessible from Hermes via jarvis-net bridge gateway (10.0.6.1:8000)
+- [x] COOLIFY_API_URL + COOLIFY_API_TOKEN wired into root `.env`
+- [x] Endpoint live: version "4.1.2" + real server/service data confirmed
+- [x] Fixed Redis config crash (removed requirepass when REDIS_PASSWORD unset)
+- [x] Fixed Hermes port conflict with Coolify (host port 8000→8001)
+
+---
+
 ## Session Log
 
 ### 2026-06-29

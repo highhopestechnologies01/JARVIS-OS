@@ -1,7 +1,7 @@
 """
 Coolify API integration.
 Provides read access to Coolify deployment state for JARVIS context.
-Base URL: http://<VPS_PUBLIC_IP>:8080 (reachable from all Docker containers via host routing)
+Base URL: http://10.0.6.1:8000 (jarvis-net bridge gateway → Coolify port 8000 on host)
 """
 
 import os
@@ -12,7 +12,7 @@ import structlog
 
 log = structlog.get_logger()
 
-COOLIFY_API_URL = os.getenv("COOLIFY_API_URL", "http://162.35.161.135:8080")
+COOLIFY_API_URL = os.getenv("COOLIFY_API_URL", "http://10.0.6.1:8000")
 COOLIFY_API_TOKEN = os.getenv("COOLIFY_API_TOKEN", "")
 
 

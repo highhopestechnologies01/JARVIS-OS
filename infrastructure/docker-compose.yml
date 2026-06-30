@@ -50,13 +50,13 @@ services:
     image: redis:7-alpine
     container_name: jarvis-redis
     restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
     networks:
       - jarvis-net
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -73,7 +73,7 @@ services:
     env_file:
       - ../.env
     ports:
-      - "127.0.0.1:8000:8000"   # Tailscale-accessible only (bind to loopback)
+      - "127.0.0.1:8001:8000"   # Tailscale-accessible only (bind to loopback)
     networks:
       - jarvis-net
     depends_on:
