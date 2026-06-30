@@ -423,31 +423,29 @@ async def scrape_profile(profile: dict) -> dict:
             await cdp_send(ws, "Runtime.enable")
 
             current_url = ads_tab.get("url", "")
+            ads_manager_url = "https://adsmanager.facebook.com/adsmanager/manage/campaigns"
 
             # ── Strategy 1: Network interception for access token ─────────
-            # If already on Ads Manager, reload to intercept API calls.
-            # If on other FB page, navigate to Ads Manager first.
-            if "adsmanager.facebook.com" in current_url:
+            # Only reload if already on Ads Manager (authenticated session).
+            # For login/blocked/error pages, navigate directly to adsmanager.
+            bad_url = any(x in current_url for x in [
+                "loginpage", "login", "chrome-error", "about:blank",
+                "newtab", "chromewebdata", "business.facebook.com/business"
+            ])
+
+            await cdp_send(ws, "Page.enable")
+
+            if "adsmanager.facebook.com" in current_url and not bad_url:
                 print("  Intercepting network: reloading Ads Manager...")
                 token = await intercept_access_token(ws, reload=True, timeout=30.0)
-            elif "facebook.com" in current_url:
-                print("  Navigating to Ads Manager for interception...")
-                await cdp_send(ws, "Page.enable")
-                nav_id = _next_id()
-                await ws.send(json.dumps({
-                    "id": nav_id, "method": "Page.navigate",
-                    "params": {"url": "https://adsmanager.facebook.com/adsmanager/manage/campaigns"}
-                }))
-                token = await intercept_access_token(ws, reload=False, timeout=30.0)
             else:
-                print("  Navigating non-FB tab to Ads Manager...")
-                await cdp_send(ws, "Page.enable")
+                print(f"  Navigating to Ads Manager (current: {current_url[:50]})...")
                 nav_id = _next_id()
                 await ws.send(json.dumps({
                     "id": nav_id, "method": "Page.navigate",
-                    "params": {"url": "https://adsmanager.facebook.com/adsmanager/manage/campaigns"}
+                    "params": {"url": ads_manager_url}
                 }))
-                token = await intercept_access_token(ws, reload=False, timeout=30.0)
+                token = await intercept_access_token(ws, reload=False, timeout=35.0)
 
             if token:
                 print(f"  Token captured — querying Meta Marketing API...")
