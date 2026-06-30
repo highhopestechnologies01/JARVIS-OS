@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --jarvis-bg: #0a0a0f;
+  --jarvis-surface: #13131a;
+  --jarvis-border: #1e1e2e;
+  --jarvis-accent: #6366f1;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--jarvis-bg);
+  color: #e2e8f0;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--jarvis-surface); }
+::-webkit-scrollbar-thumb { background: var(--jarvis-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #2d2d40; }
+
+/* Status dot animation */
+@keyframes pulse-green {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.status-live { animation: pulse-green 2s ease-in-out infinite; }

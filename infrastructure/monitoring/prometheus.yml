@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    system: jarvis-os
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # VPS system metrics
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Hermes AI brain metrics
+  - job_name: hermes
+    static_configs:
+      - targets: ["hermes:8000"]
+    metrics_path: /metrics
+
+  # n8n metrics (if enabled)
+  - job_name: n8n
+    static_configs:
+      - targets: ["n8n:5678"]
+    metrics_path: /metrics
