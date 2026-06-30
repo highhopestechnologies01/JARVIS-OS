@@ -129,7 +129,9 @@ Mac environment fully configured.
 - [x] All 7 Docker services healthy on jarvis-net
 - [x] n8n connected to jarvis-net (health checks working)
 - [x] GitHub repo: github.com/highhopestechnologies01/JARVIS-OS
-- [ ] GitHub Actions secrets to add: `VPS_SSH_KEY`, `VPS_HOST` (Settings → Secrets → Actions)
+- [x] GitHub Actions secrets added: `VPS_SSH_KEY`, `VPS_HOST` ✓
+- [x] n8n automations live: health-alert handler, github-digest, prometheus-snapshot
+- [x] Hermes health check wired to n8n webhook (non-blocking POST on failures)
 - [ ] Centralized logging (Loki) — optional future improvement
 - [ ] pgvector semantic search — optional future improvement
 
@@ -190,3 +192,27 @@ Mac environment fully configured.
 #### Next Session Priority
 - Add GitHub Actions secrets (`VPS_SSH_KEY`, `VPS_HOST`) to repo Settings for CI/CD to activate
 - Optional: Loki centralized logging, pgvector semantic search
+
+### Session Report — 2026-06-30 (n8n Automations)
+#### Completed
+- Built 3 n8n workflow JSON files: health-alert handler, GitHub activity digest, Prometheus metrics snapshot
+- Imported all 3 into live n8n (Coolify-managed, n8n-n8n-1) via n8n CLI import
+- Activated all 3 workflows via host sqlite3 on `/opt/n8n/n8n_data/database.sqlite`
+- Connected n8n-n8n-1 to jarvis-net after each restart
+- Wired Hermes `infrastructure_health_check` to POST failures to `http://n8n-n8n-1:5678/webhook/jarvis-health-alert` (non-blocking)
+- Fixed health check service URL: `jarvis-n8n` → `n8n-n8n-1`
+- Deployed Hermes changes via GitHub Actions CI/CD
+#### Files Modified
+- hermes/src/core/jobs.py (n8n webhook + service URL fix)
+- n8n/workflows/01-health-alert.json (new)
+- n8n/workflows/02-github-activity.json (new)
+- n8n/workflows/03-metrics-snapshot.json (new)
+- ROADMAP.md
+#### Errors / Blockers
+- `n8n delete:workflow` CLI command doesn't exist — used host sqlite3 to delete
+- `sqlite3` not in n8n container — must run from host via volume mount
+- n8n loses jarvis-net on every restart — must run `docker network connect jarvis-net n8n-n8n-1` after each restart
+- Workflows imported as inactive — activated via `UPDATE workflow_entity SET active=1` on host
+#### Next Session Priority
+- Verify end-to-end: trigger health check → confirm n8n receives it → confirm memory entry created
+- Consider making n8n jarvis-net connection persistent (Coolify network config or docker-compose override)
