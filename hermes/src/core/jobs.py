@@ -114,6 +114,16 @@ async def infrastructure_health_check():
         ))
         await db.commit()
 
+    # Check RDP machines (TCP port 3389)
+    from src.integrations.rdp import check_all_rdp_hosts
+    rdp_results = await check_all_rdp_hosts()
+    for rdp in rdp_results:
+        if rdp["online"]:
+            statuses[rdp["name"]] = "ok"
+        else:
+            statuses[rdp["name"]] = "down"
+            failures.append(f"{rdp['name']}: offline ({rdp.get('error', 'unreachable')})")
+
     if failures:
         from src.core.notifications import dispatcher
         alert = "⚠️ JARVIS Health Alert:\n" + "\n".join(f"• {f}" for f in failures)

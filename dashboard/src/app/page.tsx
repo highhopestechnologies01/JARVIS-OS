@@ -7,6 +7,7 @@ import { SchedulerPanel } from "@/components/panels/SchedulerPanel";
 import { VoicePanel } from "@/components/panels/VoicePanel";
 import { IntelligencePanel } from "@/components/panels/IntelligencePanel";
 import { CoolifyPanel } from "@/components/panels/CoolifyPanel";
+import { RDPPanel } from "@/components/panels/RDPPanel";
 import { Header } from "@/components/layout/Header";
 
 export const dynamic = "force-dynamic";
@@ -56,6 +57,7 @@ export default function Dashboard() {
         </div>
 
         <div className="col-span-12 lg:col-span-4 flex flex-col gap-4">
+          <RDPPanel />
           <CoolifyPanel />
           <VoicePanel />
         </div>
