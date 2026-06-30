@@ -26,6 +26,7 @@ def register_core_jobs():
         pattern_analysis,
         autonomous_planning,
     )
+    from src.integrations.telegram_bot import process_updates
 
     jobs = [
         {
@@ -63,6 +64,12 @@ def register_core_jobs():
             "func": autonomous_planning,
             "trigger": CronTrigger(day_of_week="sun", hour=6, minute=0, timezone="America/New_York"),
             "name": "Autonomous Weekly Planning",
+        },
+        {
+            "id": "telegram_polling",
+            "func": process_updates,
+            "trigger": CronTrigger(second="*/10"),
+            "name": "Telegram Bot Polling",
         },
     ]
 
