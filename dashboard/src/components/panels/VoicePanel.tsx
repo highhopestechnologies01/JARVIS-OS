@@ -26,14 +26,16 @@ export function VoicePanel() {
     recognition.interimResults = false;
     recognition.lang = "en-US";
 
-    recognition.onresult = async (event) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recognition.onresult = async (event: any) => {
       const text = event.results[0][0].transcript;
       setTranscript(text);
       setState("processing");
       await sendToHermes(text);
     };
 
-    recognition.onerror = (event) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recognition.onerror = (event: any) => {
       setErrorMsg(`Mic error: ${event.error}`);
       setState("error");
     };
