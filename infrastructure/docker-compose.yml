@@ -99,6 +99,9 @@ services:
       dockerfile: Dockerfile
     container_name: jarvis-dashboard
     restart: unless-stopped
+    environment:
+      PORT: "3000"        # Explicit override — .env may contain PORT=3001 for other services
+      NODE_ENV: production
     env_file:
       - ../.env
     ports:
