@@ -502,28 +502,219 @@ async def fetch_via_meta_api(token: str, known_account_ids: list[str] = None) ->
         print(f"    [ERROR] Meta API: {e}")
     return results
 
+# ── Network response body capture ─────────────────────────────────────────────
+
+def parse_fb_graphql_for_campaigns(body: str) -> list[dict]:
+    """Parse campaign data from Facebook's internal GraphQL or Marketing API responses."""
+    if not body:
+        return []
+    campaigns = []
+    try:
+        # Strip JSONP prefix Facebook sometimes adds
+        if body.startswith("for (;;);"):
+            body = body[9:]
+        data = json.loads(body)
+
+        def search(obj, depth=0):
+            if depth > 20:
+                return
+            if isinstance(obj, dict):
+                # Public Marketing API: campaign_name + spend/impressions
+                if "campaign_name" in obj and ("spend" in obj or "impressions" in obj):
+                    campaigns.append({
+                        "name": obj.get("campaign_name", ""),
+                        "status": obj.get("effective_status", obj.get("status", "")),
+                        "spend": f"${float(obj.get('spend', 0)):.2f}" if obj.get("spend") else "",
+                        "impressions": str(obj.get("impressions", "")),
+                        "clicks": str(obj.get("clicks", "")),
+                        "ctr": str(obj.get("ctr", "")),
+                        "cpm": str(obj.get("cpm", "")),
+                        "cpc": str(obj.get("cpc", "")),
+                    })
+                    return
+                # Internal GraphQL: name + delivery_status or insights
+                name = obj.get("name")
+                if isinstance(name, str) and len(name) > 2:
+                    has_delivery = "delivery_status" in obj or "effective_status" in obj
+                    has_insights = "insights" in obj
+                    if has_delivery or has_insights:
+                        c = {
+                            "name": name,
+                            "status": "",
+                            "spend": "", "impressions": "", "clicks": "",
+                            "ctr": "", "cpm": "", "cpc": "",
+                        }
+                        ds = obj.get("delivery_status")
+                        if isinstance(ds, dict):
+                            c["status"] = ds.get("text", "")
+                        elif obj.get("effective_status"):
+                            c["status"] = obj["effective_status"]
+                        insights = obj.get("insights")
+                        if isinstance(insights, dict):
+                            # edges or data list
+                            items = insights.get("data") or insights.get("edges", [])
+                            if isinstance(items, list) and items:
+                                ins = items[0]
+                                if isinstance(ins, dict) and "node" in ins:
+                                    ins = ins["node"]
+                                c["spend"] = f"${float(ins.get('spend', 0)):.2f}" if ins.get("spend") else ""
+                                c["impressions"] = str(ins.get("impressions", ""))
+                                c["clicks"] = str(ins.get("clicks", ""))
+                                c["ctr"] = str(ins.get("ctr", ""))
+                                c["cpm"] = str(ins.get("cpm", ""))
+                                c["cpc"] = str(ins.get("cpc", ""))
+                            elif "spend" in insights:
+                                c["spend"] = f"${float(insights.get('spend', 0)):.2f}" if insights.get("spend") else ""
+                        campaigns.append(c)
+                        return
+                for v in obj.values():
+                    search(v, depth + 1)
+            elif isinstance(obj, list):
+                for item in obj:
+                    search(item, depth + 1)
+
+        search(data)
+    except Exception:
+        pass
+    return campaigns
+
+
+async def capture_network_responses(ws_url: str, timeout: float = 35.0) -> list[dict]:
+    """
+    Enable Network on page CDP, trigger UI, capture response bodies from
+    ALL graph.facebook.com calls. Returns campaign data parsed from responses.
+    Bypasses token entirely — we read data the browser already received.
+    """
+    all_campaigns: list[dict] = []
+    try:
+        async with websockets.connect(
+            ws_url, ping_interval=None, open_timeout=15, close_timeout=5
+        ) as ws:
+            await cdp_send(ws, "Runtime.enable")
+            await cdp_send(ws, "Network.enable")
+            trigger = await cdp_eval(ws, JS_TRIGGER_REFRESH)
+            print(f"  Network capture trigger: {trigger}")
+
+            pending: dict[str, str] = {}
+            bodies_checked = 0
+
+            deadline = asyncio.get_event_loop().time() + timeout
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    evt = json.loads(raw)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+
+                method = evt.get("method", "")
+                params = evt.get("params", {})
+
+                if method == "Network.responseReceived":
+                    url = params.get("response", {}).get("url", "")
+                    req_id = params.get("requestId", "")
+                    if req_id and (
+                        "graph.facebook.com" in url
+                        or "facebook.com/api/graphql" in url
+                    ):
+                        pending[req_id] = url
+                        print(f"  → FB response: {url[:80]}")
+
+                if method == "Network.loadingFinished":
+                    req_id = params.get("requestId", "")
+                    if req_id in pending:
+                        url = pending.pop(req_id)
+                        try:
+                            br = await cdp_send(ws, "Network.getResponseBody", {"requestId": req_id})
+                            body = br.get("body", "")
+                            if br.get("base64Encoded"):
+                                import base64 as _b64
+                                body = _b64.b64decode(body).decode("utf-8", errors="replace")
+                            if body:
+                                bodies_checked += 1
+                                parsed = parse_fb_graphql_for_campaigns(body)
+                                if parsed:
+                                    print(f"  ✓ {len(parsed)} campaigns from response body")
+                                    all_campaigns.extend(parsed)
+                        except Exception as ex:
+                            print(f"  Body extract error: {ex}")
+
+                # Have enough data — stop early
+                if all_campaigns and bodies_checked >= 3:
+                    break
+
+            print(f"  Network capture: {bodies_checked} bodies, {len(all_campaigns)} campaigns")
+    except Exception as e:
+        print(f"  Network capture error: {e}")
+    return all_campaigns
+
+
 # ── DOM extraction ────────────────────────────────────────────────────────────
 
 DOM_EXTRACT_JS = r"""
 (function() {
     try {
+        var urlMatch = location.href.match(/act[_=](\d+)/);
+        var accountId = urlMatch ? urlMatch[1] : null;
+
+        // --- Strategy A: role="row" grid (standard ARIA table) ---
         var rows = Array.from(document.querySelectorAll('[role="row"]'));
         var dataRows = rows.filter(function(r) {
             return r.querySelectorAll('[role="cell"],[role="gridcell"]').length >= 3;
         });
-        if (!dataRows.length) {
-            return JSON.stringify({found:false, url:location.href, title:document.title,
-                snippet:(document.body||{}).innerText?document.body.innerText.slice(0,500):''});
+        if (dataRows.length) {
+            var campaigns = dataRows.map(function(row) {
+                var cells = Array.from(row.querySelectorAll('[role="cell"],[role="gridcell"],td'));
+                var t = cells.map(function(c){return c.innerText.trim();});
+                return {name:t[0]||'',status:t[1]||'',budget:t[2]||'',impressions:t[4]||'',
+                        clicks:t[5]||'',ctr:t[6]||'',cpc:t[7]||'',spend:t[t.length-1]||''};
+            }).filter(function(c){return c.name&&c.name.length>1;});
+            if (campaigns.length > 0)
+                return JSON.stringify({found:true, source:'role_row', campaigns:campaigns,
+                    accountId:accountId, url:location.href});
         }
-        var campaigns = dataRows.map(function(row) {
-            var cells = Array.from(row.querySelectorAll('[role="cell"],[role="gridcell"],td'));
-            var t = cells.map(function(c){return c.innerText.trim();});
-            return {name:t[0]||'',status:t[1]||'',budget:t[2]||'',impressions:t[4]||'',
-                    clicks:t[5]||'',ctr:t[6]||'',cpc:t[7]||'',spend:t[t.length-1]||''};
-        }).filter(function(c){return c.name&&c.name.length>1;});
-        var urlMatch = location.href.match(/act[_=](\d+)/);
-        return JSON.stringify({found:campaigns.length>0, campaigns:campaigns,
-            accountId:urlMatch?urlMatch[1]:null, accountName:document.title, url:location.href});
+
+        // --- Strategy B: aria-rowindex elements ---
+        var ariaRows = Array.from(document.querySelectorAll('[aria-rowindex]'));
+        if (ariaRows.length) {
+            var campaigns2 = ariaRows.map(function(row) {
+                var t = row.innerText.split('\n').map(function(s){return s.trim();}).filter(Boolean);
+                return {name:t[0]||'',status:t[1]||'',spend:t[t.length-1]||''};
+            }).filter(function(c){return c.name&&c.name.length>1;});
+            if (campaigns2.length > 0)
+                return JSON.stringify({found:true, source:'aria_rowindex', campaigns:campaigns2,
+                    accountId:accountId, url:location.href});
+        }
+
+        // --- Strategy C: data-testid rows ---
+        var testidRows = Array.from(document.querySelectorAll(
+            '[data-testid*="campaign-row"],[data-testid*="adset-row"],[data-testid*="ad-row"]'
+        ));
+        if (testidRows.length) {
+            var campaigns3 = testidRows.map(function(row) {
+                var t = row.innerText.split('\n').map(function(s){return s.trim();}).filter(Boolean);
+                return {name:t[0]||'',status:t[1]||'',spend:t[t.length-1]||''};
+            }).filter(function(c){return c.name&&c.name.length>1;});
+            if (campaigns3.length > 0)
+                return JSON.stringify({found:true, source:'testid', campaigns:campaigns3,
+                    accountId:accountId, url:location.href});
+        }
+
+        // --- Strategy D: full body text with spend pattern extraction ---
+        var bodyText = document.body.innerText || '';
+        // Look for $ amounts — these are spend values
+        var spendMatches = bodyText.match(/\$[\d,]+\.?\d*/g) || [];
+        // Get a large chunk of body text to return for analysis
+        return JSON.stringify({
+            found: false,
+            url: location.href,
+            title: document.title,
+            bodyLength: bodyText.length,
+            spendAmounts: spendMatches.slice(0, 20),
+            bodyText: bodyText.slice(0, 3000),
+            accountId: accountId,
+        });
     } catch(e) {
         return JSON.stringify({found:false, error:e.message, url:location.href});
     }
@@ -749,34 +940,83 @@ async def scrape_profile(profile: dict) -> dict:
         else:
             print("  No token found — falling back to DOM scrape")
 
-        # ── Strategy 4: DOM scrape (open fresh connection) ─────────────────
-        await asyncio.sleep(3)
-        async with websockets.connect(
-            ws_url, ping_interval=None, open_timeout=15, close_timeout=5
-        ) as ws:
-            await cdp_send(ws, "Runtime.enable")
-            dom_raw = await cdp_eval(ws, DOM_EXTRACT_JS)
-            if dom_raw:
-                try:
-                    dom = json.loads(dom_raw)
-                except Exception:
-                    dom = {"found": False}
+        # ── Strategy 3: Network response body capture ─────────────────────
+        # The page makes internal GraphQL calls to graph.facebook.com — we read
+        # their response bodies directly. No access token needed.
+        if not result["campaigns"]:
+            print("  Strategy 3: Capturing network response bodies...")
+            net_campaigns = await capture_network_responses(ws_url, timeout=35.0)
+            if net_campaigns:
+                # Deduplicate by name
+                seen: set[str] = set()
+                unique = []
+                for c in net_campaigns:
+                    if c["name"] not in seen:
+                        seen.add(c["name"])
+                        unique.append(c)
+                net_campaigns = unique
 
-                if dom.get("found"):
-                    result["ad_account_id"] = dom.get("accountId")
-                    result["ad_account_name"] = dom.get("accountName")
-                    campaigns, summary = parse_dom_campaigns(dom.get("campaigns", []))
-                    result["campaigns"] = campaigns
-                    result["summary"] = summary
-                    print(f"  DOM: {len(campaigns)} campaigns extracted")
+                result["ad_account_id"] = account_ids_from_url[0] if account_ids_from_url else None
+                result["ad_account_name"] = "Ads Manager"
+                result["campaigns"] = net_campaigns
+
+                t_spend = t_impr = t_clicks = t_active = 0
+                for c in net_campaigns:
+                    sp = re.sub(r"[^\d.]", "", c.get("spend", "") or "")
+                    try: t_spend += float(sp) if sp else 0
+                    except: pass
+                    try: t_impr += int(re.sub(r"[^\d]", "", c.get("impressions", "") or "0") or "0")
+                    except: pass
+                    try: t_clicks += int(re.sub(r"[^\d]", "", c.get("clicks", "") or "0") or "0")
+                    except: pass
+                    if "active" in (c.get("status") or "").lower() or "delivering" in (c.get("status") or "").lower():
+                        t_active += 1
+
+                result["summary"] = {
+                    "total_spend": round(t_spend, 2),
+                    "total_impressions": t_impr,
+                    "total_clicks": t_clicks,
+                    "active_campaigns": t_active,
+                    "avg_ctr": round(t_clicks / t_impr * 100, 2) if t_impr else 0,
+                }
+                print(f"  ✓ Network capture: {len(net_campaigns)} campaigns, ${t_spend:.2f} spend")
+                return result
+
+        # ── Strategy 4: DOM scrape (open fresh connection) ─────────────────
+        if not result["campaigns"]:
+            await asyncio.sleep(2)
+            async with websockets.connect(
+                ws_url, ping_interval=None, open_timeout=15, close_timeout=5
+            ) as ws:
+                await cdp_send(ws, "Runtime.enable")
+                dom_raw = await cdp_eval(ws, DOM_EXTRACT_JS)
+                if dom_raw:
+                    try:
+                        dom = json.loads(dom_raw)
+                    except Exception:
+                        dom = {"found": False}
+
+                    if dom.get("found"):
+                        result["ad_account_id"] = dom.get("accountId")
+                        result["ad_account_name"] = dom.get("accountName", dom.get("title", ""))
+                        campaigns, summary = parse_dom_campaigns(dom.get("campaigns", []))
+                        result["campaigns"] = campaigns
+                        result["summary"] = summary
+                        print(f"  DOM: {len(campaigns)} campaigns from {dom.get('source','?')}")
+                    else:
+                        url = dom.get("url", "")
+                        body_text = dom.get("bodyText", "")
+                        spend_amounts = dom.get("spendAmounts", [])
+                        result["error"] = f"DOM no table. URL={url}"
+                        print(f"  DOM failed. URL: {url}")
+                        print(f"  Body length: {dom.get('bodyLength', 0)}")
+                        if spend_amounts:
+                            print(f"  Spend amounts in DOM: {spend_amounts}")
+                        if body_text:
+                            # Print first 800 chars for diagnosis
+                            print(f"  Body text (first 800):\n{body_text[:800]}")
                 else:
-                    url = dom.get("url", "")
-                    snippet = dom.get("snippet", dom.get("bodySnippet", ""))[:100]
-                    result["error"] = f"DOM no table. URL={url}"
-                    print(f"  DOM failed. URL: {url}")
-                    print(f"  Snippet: {snippet}")
-            else:
-                result["error"] = "Empty DOM result"
+                    result["error"] = "Empty DOM result"
 
     except Exception as e:
         result["error"] = str(e)
