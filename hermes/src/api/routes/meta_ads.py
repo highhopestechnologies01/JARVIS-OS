@@ -5,6 +5,7 @@ and query endpoints (serves dashboard + Telegram).
 Auth: X-Scraper-Token header on POST /ingest.
 """
 
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.connection import get_db
-from src.db.models import MetaAdsSnapshot
+from src.db.models import MetaAdsSnapshot, Memory
 
 log = structlog.get_logger()
 router = APIRouter(prefix="/api/v1/meta-ads", tags=["meta-ads"])
@@ -152,6 +153,47 @@ async def summary(db: AsyncSession = Depends(get_db)):
         "profiles": profiles_out,
         "stale": len(latest) == 0,
     }
+
+
+@router.get("/control")
+async def get_control(db: AsyncSession = Depends(get_db)):
+    """Return scraper enabled/disabled state."""
+    result = await db.execute(
+        select(Memory).where(Memory.type == "config", Memory.topic == "scraper_control")
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return {"enabled": True, "updated_at": None}
+    data = json.loads(row.content)
+    return {
+        "enabled": data.get("enabled", True),
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+class ControlPayload(BaseModel):
+    enabled: bool
+
+
+@router.post("/control")
+async def set_control(
+    payload: ControlPayload,
+    db: AsyncSession = Depends(get_db),
+):
+    """Enable or disable the scraper. Called by dashboard toggle."""
+    result = await db.execute(
+        select(Memory).where(Memory.type == "config", Memory.topic == "scraper_control")
+    )
+    row = result.scalar_one_or_none()
+    content = json.dumps({"enabled": payload.enabled})
+    if row is None:
+        row = Memory(type="config", topic="scraper_control", content=content, importance=10)
+        db.add(row)
+    else:
+        row.content = content
+    await db.commit()
+    log.info("meta_ads.control", enabled=payload.enabled)
+    return {"enabled": payload.enabled}
 
 
 @router.get("/campaigns")

@@ -1199,6 +1199,16 @@ async def main():
     print(f"=== JARVIS Meta Ads Scraper v3 — {rdp_host} ===")
     print(f"Hermes: {hermes_url}")
 
+    # ── Control check: bail out if dashboard has disabled the scraper ──────────
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            ctrl = await client.get(f"{hermes_url}/api/v1/meta-ads/control")
+            if ctrl.status_code == 200 and not ctrl.json().get("enabled", True):
+                print("[INFO] Scraper disabled via dashboard. Exiting.")
+                return
+    except Exception as e:
+        print(f"[WARN] Could not reach control endpoint ({e}) — proceeding.")
+
     fixed_ports = config.get("fixed_ports", [])
     profiles = await get_active_profiles(adspower_url, fixed_ports=fixed_ports)
     if not profiles:
