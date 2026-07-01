@@ -1,4 +1,5 @@
 {
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567802",
   "name": "JARVIS — GitHub Activity Digest",
   "nodes": [
     {
@@ -72,19 +73,11 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://jarvis-hermes:8000/api/v1/memory",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
+        "url": "http://jarvis-hermes:8000/api/v1/memory/",
         "sendBody": true,
-        "contentType": "json",
-        "body": "={{ JSON.stringify({ type: 'github_activity', topic: 'jarvis_os_commits', content: $json.summary, importance: 4, source: 'n8n_github_digest' }) }}"
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ type: 'github_activity', topic: 'jarvis_os_commits', content: $json.summary, importance: 4, source: 'n8n_github_digest', metadata: { commit_count: $json.commit_count, latest_sha: $json.latest_sha, latest_message: $json.latest_message } }) }}"
       },
       "id": "store-commits",
       "name": "Store in Hermes Memory",
@@ -95,19 +88,11 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://jarvis-hermes:8000/api/v1/events",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
+        "url": "http://jarvis-hermes:8000/api/v1/memory/",
         "sendBody": true,
-        "contentType": "json",
-        "body": "={{ JSON.stringify({ type: 'n8n.github_digest_completed', source: 'n8n_github_digest', payload: { commit_count: $json.commit_count, latest_sha: $json.latest_sha, latest_message: $json.latest_message } }) }}"
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ type: 'system_event', topic: 'github_digest_complete', content: 'GitHub digest processed: ' + $json.commit_count + ' commits. Latest: ' + $json.latest_sha + ' — ' + $json.latest_message, importance: 2, source: 'n8n_github_digest' }) }}"
       },
       "id": "log-event",
       "name": "Log Event to Hermes",

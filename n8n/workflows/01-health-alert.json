@@ -1,4 +1,5 @@
 {
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567801",
   "name": "JARVIS — Health Alert Handler",
   "nodes": [
     {
@@ -45,18 +46,10 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://jarvis-hermes:8000/api/v1/memory",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
+        "url": "http://jarvis-hermes:8000/api/v1/memory/",
         "sendBody": true,
-        "contentType": "json",
+        "contentType": "raw",
+        "rawContentType": "application/json",
         "body": "={{ JSON.stringify({ type: 'health_alert', topic: 'infrastructure_failure', content: $json.summary + '\\n\\n' + $json.all_statuses_text, importance: $json.importance, source: 'n8n_health_alert_workflow' }) }}"
       },
       "id": "store-alert-memory",
@@ -68,19 +61,11 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://jarvis-hermes:8000/api/v1/events",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
+        "url": "http://jarvis-hermes:8000/api/v1/memory/",
         "sendBody": true,
-        "contentType": "json",
-        "body": "={{ JSON.stringify({ type: 'n8n.health_alert_processed', source: 'n8n_health_alert_workflow', payload: { summary: $json.summary, failures: $json.failures, timestamp: $json.timestamp } }) }}"
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ type: 'system_event', topic: 'infrastructure_ok', content: $json.summary + ' — ' + $json.timestamp, importance: 2, source: 'n8n_health_alert_workflow' }) }}"
       },
       "id": "log-event",
       "name": "Log Event to Hermes",

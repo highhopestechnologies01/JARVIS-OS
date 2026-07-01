@@ -1,4 +1,5 @@
 {
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567803",
   "name": "JARVIS — Prometheus Metrics Snapshot",
   "nodes": [
     {
@@ -42,7 +43,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Get results from both HTTP requests\nconst allItems = $input.all();\nconst upData = allItems[0]?.json;\nconst memData = allItems[1]?.json;\n\n// Parse up/down status\nconst services = [];\nif (upData?.data?.result) {\n  for (const r of upData.data.result) {\n    const name = r.metric?.job || r.metric?.instance || 'unknown';\n    const status = r.value?.[1] === '1' ? 'up' : 'down';\n    services.push(`${status === 'up' ? '✓' : '✗'} ${name}: ${status}`);\n  }\n}\n\n// Parse memory\nlet memGB = null;\nif (memData?.data?.result?.[0]?.value?.[1]) {\n  const bytes = parseFloat(memData.data.result[0].value[1]);\n  memGB = (bytes / 1024 / 1024 / 1024).toFixed(2);\n}\n\nconst timestamp = new Date().toISOString();\nconst servicesText = services.length > 0 ? services.join('\\n') : 'no metrics available';\nconst memText = memGB ? `Memory available: ${memGB} GB` : 'Memory: unavailable';\n\nconst summary = `Hourly metrics snapshot (${new Date().toLocaleTimeString()}):\\n${memText}\\nServices:\\n${servicesText}`;\n\nreturn [{\n  json: {\n    summary,\n    memory_gb_available: memGB,\n    services_up: services.filter(s => s.includes('✓')).length,\n    services_down: services.filter(s => s.includes('✗')).length,\n    timestamp\n  }\n}];"
+        "jsCode": "const allItems = $input.all();\nconst upData = allItems[0]?.json;\nconst memData = allItems[1]?.json;\n\nconst services = [];\nif (upData?.data?.result) {\n  for (const r of upData.data.result) {\n    const name = r.metric?.job || r.metric?.instance || 'unknown';\n    const status = r.value?.[1] === '1' ? 'up' : 'down';\n    services.push(`${status === 'up' ? '✓' : '✗'} ${name}: ${status}`);\n  }\n}\n\nlet memGB = null;\nif (memData?.data?.result?.[0]?.value?.[1]) {\n  const bytes = parseFloat(memData.data.result[0].value[1]);\n  memGB = (bytes / 1024 / 1024 / 1024).toFixed(2);\n}\n\nconst timestamp = new Date().toISOString();\nconst servicesText = services.length > 0 ? services.join('\\n') : 'no metrics available';\nconst memText = memGB ? `Memory available: ${memGB} GB` : 'Memory: unavailable';\n\nconst summary = `Hourly metrics snapshot (${new Date().toLocaleTimeString()}):\\n${memText}\\nServices:\\n${servicesText}`;\n\nreturn [{\n  json: {\n    summary,\n    memory_gb_available: memGB,\n    services_up: services.filter(s => s.includes('✓')).length,\n    services_down: services.filter(s => s.includes('✗')).length,\n    timestamp\n  }\n}];"
       },
       "id": "format-metrics",
       "name": "Format Metrics",
@@ -53,19 +54,11 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://jarvis-hermes:8000/api/v1/events",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
+        "url": "http://jarvis-hermes:8000/api/v1/memory/",
         "sendBody": true,
-        "contentType": "json",
-        "body": "={{ JSON.stringify({ type: 'n8n.metrics_snapshot', source: 'n8n_prometheus_snapshot', payload: { memory_gb_available: $json.memory_gb_available, services_up: $json.services_up, services_down: $json.services_down, summary: $json.summary, timestamp: $json.timestamp } }) }}"
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ type: 'metrics_snapshot', topic: 'infrastructure_metrics', content: $json.summary, importance: 3, source: 'n8n_prometheus_snapshot', metadata: { memory_gb_available: $json.memory_gb_available, services_up: $json.services_up, services_down: $json.services_down } }) }}"
       },
       "id": "store-metrics",
       "name": "Store Metrics in Hermes",

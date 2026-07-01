@@ -1,0 +1,104 @@
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567804",
+  "name": "JARVIS — Daily Briefing Push",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every Day 8am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/scheduler/trigger/daily_briefing"
+      },
+      "id": "trigger-briefing",
+      "name": "Trigger Hermes Briefing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "amount": 5,
+        "unit": "seconds"
+      },
+      "id": "wait-node",
+      "name": "Wait 5s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "webhookId": "briefing-wait"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://jarvis-hermes:8000/api/v1/memory/?type=daily_briefing&limit=1"
+      },
+      "id": "fetch-briefing",
+      "name": "Fetch Latest Briefing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst briefings = items[0]?.json;\n\nif (!Array.isArray(briefings) || briefings.length === 0) {\n  return [{ json: { success: false, message: 'No briefing found' } }];\n}\n\nconst latest = briefings[0];\nconst today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });\n\nreturn [{\n  json: {\n    success: true,\n    briefing_id: latest.id,\n    content: latest.content,\n    created_at: latest.created_at,\n    today,\n    summary: `Daily briefing delivered: ${today}`\n  }\n}];"
+      },
+      "id": "format-briefing",
+      "name": "Format Briefing Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/memory/",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ type: 'briefing_delivery', topic: 'daily_operations', content: $json.summary + ' — ' + $json.today, importance: 5, source: 'n8n_daily_briefing_push' }) }}"
+      },
+      "id": "log-delivery",
+      "name": "Log Delivery to Hermes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 300]
+    }
+  ],
+  "connections": {
+    "Every Day 8am": {
+      "main": [[{ "node": "Trigger Hermes Briefing", "type": "main", "index": 0 }]]
+    },
+    "Trigger Hermes Briefing": {
+      "main": [[{ "node": "Wait 5s", "type": "main", "index": 0 }]]
+    },
+    "Wait 5s": {
+      "main": [[{ "node": "Fetch Latest Briefing", "type": "main", "index": 0 }]]
+    },
+    "Fetch Latest Briefing": {
+      "main": [[{ "node": "Format Briefing Result", "type": "main", "index": 0 }]]
+    },
+    "Format Briefing Result": {
+      "main": [[{ "node": "Log Delivery to Hermes", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["jarvis", "briefing", "daily"]
+}

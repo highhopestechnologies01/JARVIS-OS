@@ -1,0 +1,109 @@
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567805",
+  "name": "JARVIS — Weekly Memory Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 23 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every Sunday 11pm",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://jarvis-hermes:8000/api/v1/memory/?type=health_alert&limit=20"
+      },
+      "id": "fetch-alerts",
+      "name": "Fetch This Week Alerts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 180]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://jarvis-hermes:8000/api/v1/memory/?type=github_activity&limit=10"
+      },
+      "id": "fetch-github",
+      "name": "Fetch GitHub Activity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://jarvis-hermes:8000/api/v1/memory/?type=metrics_snapshot&limit=5"
+      },
+      "id": "fetch-metrics",
+      "name": "Fetch Metrics History",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const allItems = $input.all();\nconst alerts = Array.isArray(allItems[0]?.json) ? allItems[0].json : [];\nconst github = Array.isArray(allItems[1]?.json) ? allItems[1].json : [];\nconst metrics = Array.isArray(allItems[2]?.json) ? allItems[2].json : [];\n\nconst weekStart = new Date();\nweekStart.setDate(weekStart.getDate() - 7);\nconst weekLabel = weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });\nconst today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });\n\nconst sections = [];\n\n// Infrastructure\nconst criticalAlerts = alerts.filter(a => (a.importance || 0) >= 8);\nsections.push(`📊 INFRASTRUCTURE (${weekLabel} – ${today})`);\nsections.push(`Health alerts: ${alerts.length} total, ${criticalAlerts.length} critical`);\nif (criticalAlerts.length > 0) {\n  sections.push('Critical: ' + criticalAlerts.slice(0, 3).map(a => a.content?.split('\\n')[0]).join('; '));\n}\n\n// GitHub\nsections.push('');\nsections.push(`💻 CODE ACTIVITY`);\nsections.push(`GitHub digests: ${github.length} entries`);\nif (github.length > 0) {\n  sections.push('Latest: ' + (github[0]?.content?.split('\\n')[1] || 'no commits recorded'));\n}\n\n// Metrics\nsections.push('');\nsections.push(`📈 SYSTEM METRICS`);\nif (metrics.length > 0) {\n  const latest = metrics[0];\n  sections.push('Latest snapshot: ' + (latest.content?.split('\\n')[0] || 'unavailable'));\n}\n\nconst digest = sections.join('\\n');\nconst title = `Weekly Digest: ${weekLabel} – ${today}`;\n\nreturn [{\n  json: {\n    title,\n    digest,\n    alert_count: alerts.length,\n    critical_count: criticalAlerts.length,\n    github_entries: github.length,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "build-digest",
+      "name": "Build Weekly Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://jarvis-hermes:8000/api/v1/memory/",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ type: 'weekly_digest', topic: 'weekly_operations_summary', content: $json.title + '\\n\\n' + $json.digest, importance: 7, source: 'n8n_weekly_digest', metadata: { alert_count: $json.alert_count, critical_count: $json.critical_count, github_entries: $json.github_entries } }) }}"
+      },
+      "id": "store-digest",
+      "name": "Store Weekly Digest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 300]
+    }
+  ],
+  "connections": {
+    "Every Sunday 11pm": {
+      "main": [
+        [
+          { "node": "Fetch This Week Alerts", "type": "main", "index": 0 },
+          { "node": "Fetch GitHub Activity", "type": "main", "index": 0 },
+          { "node": "Fetch Metrics History", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch This Week Alerts": {
+      "main": [[{ "node": "Build Weekly Digest", "type": "main", "index": 0 }]]
+    },
+    "Fetch GitHub Activity": {
+      "main": [[{ "node": "Build Weekly Digest", "type": "main", "index": 1 }]]
+    },
+    "Fetch Metrics History": {
+      "main": [[{ "node": "Build Weekly Digest", "type": "main", "index": 2 }]]
+    },
+    "Build Weekly Digest": {
+      "main": [[{ "node": "Store Weekly Digest", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["jarvis", "weekly", "digest", "memory"]
+}

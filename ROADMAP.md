@@ -96,7 +96,7 @@ Mac environment fully configured.
 - [x] Memory consolidation (2am daily) — prunes expired entries
 - [x] Scheduler API — GET /api/v1/scheduler/jobs, POST /trigger/{job_id}
 - [x] SchedulerPanel — live next-run countdowns, ▶ run buttons per job
-- [ ] n8n workflows: at least 5 automations live (Phase 7)
+- [x] n8n workflows: 5 automations live — health-alert, github-digest, metrics-snapshot, daily-briefing-push, weekly-digest ✅
 - [ ] Auto-restart failed services (Phase 8)
 
 ---
@@ -132,6 +132,7 @@ Mac environment fully configured.
 - [x] GitHub Actions secrets added: `VPS_SSH_KEY`, `VPS_HOST` ✓
 - [x] n8n automations live: health-alert handler, github-digest, prometheus-snapshot
 - [x] Hermes health check wired to n8n webhook (non-blocking POST on failures)
+- [x] n8n pipeline fully debugged — contentType=raw fix for HTTP Request node v4.2
 - [ ] Centralized logging (Loki) — optional future improvement
 - [ ] pgvector semantic search — optional future improvement
 
@@ -244,3 +245,30 @@ Mac environment fully configured.
 #### Next Session Priority
 - Verify end-to-end: trigger health check → confirm n8n receives it → confirm memory entry created
 - Consider making n8n jarvis-net connection persistent (Coolify network config or docker-compose override)
+
+### Session Report — 2026-07-01 (n8n Pipeline + Workflows 4-5)
+#### Completed
+- Diagnosed n8n HTTP Request node v4.2 bug: contentType=json double-encodes body, Hermes receives empty string ""
+- Fix confirmed: contentType=raw + rawContentType=application/json sends body verbatim → 200 OK
+- Applied fix to all 5 HTTP nodes across workflows 1-3; all executions now status=success ✅
+- Fixed jarvis-dashboard health check: was using `curl` (not in alpine), switched to `wget /api/health`
+- Added Next.js `GET /api/health` route to dashboard
+- Updated workflows 1-3 to use dynamic n8n expressions (=$json data) instead of hardcoded bodies
+- Created workflow 4: Daily Briefing Push (triggers Hermes briefing 8am, logs delivery)
+- Created workflow 5: Weekly Memory Digest (Sunday 11pm, aggregates week's alerts/github/metrics)
+- Written scripts/activate-workflows-4-5.sh for VPS activation
+#### Files Modified
+- dashboard/src/app/api/health/route.ts (new)
+- dashboard/Dockerfile (health check → wget /api/health)
+- infrastructure/docker-compose.yml (health check → wget /api/health)
+- n8n/workflows/01-health-alert.json (contentType=raw + dynamic body)
+- n8n/workflows/02-github-activity.json (contentType=raw + dynamic body)
+- n8n/workflows/03-metrics-snapshot.json (contentType=raw + dynamic body)
+- n8n/workflows/04-daily-briefing-push.json (new)
+- n8n/workflows/05-weekly-digest.json (new)
+- scripts/activate-workflows-4-5.sh (new)
+- ROADMAP.md
+#### Next Session Priority
+- Run: bash /opt/jarvis-repo/scripts/activate-workflows-4-5.sh on VPS
+- Test workflow 4 (daily briefing push) manually
+- Add Twilio SMS or tighten Telegram notification routing
