@@ -732,40 +732,44 @@ async def scrape_profile(profile: dict) -> dict:
         # ── Use token with Meta Marketing API ─────────────────────────────
         if token:
             api_data = await fetch_via_meta_api(token, known_account_ids=account_ids_from_url)
-                if api_data:
-                    all_campaigns = []
-                    total_spend = total_impr = total_clicks = active = 0
-                    for acc in api_data:
-                        for c in acc["campaigns"]:
-                            c["ad_account"] = acc["account_name"]
-                            all_campaigns.append(c)
-                        total_spend += acc["summary"].get("total_spend", 0)
-                        total_impr += acc["summary"].get("total_impressions", 0)
-                        total_clicks += acc["summary"].get("total_clicks", 0)
-                        active += acc["summary"].get("active_campaigns", 0)
+            if api_data:
+                all_campaigns = []
+                total_spend = total_impr = total_clicks = active = 0
+                for acc in api_data:
+                    for c in acc["campaigns"]:
+                        c["ad_account"] = acc["account_name"]
+                        all_campaigns.append(c)
+                    total_spend += acc["summary"].get("total_spend", 0)
+                    total_impr += acc["summary"].get("total_impressions", 0)
+                    total_clicks += acc["summary"].get("total_clicks", 0)
+                    active += acc["summary"].get("active_campaigns", 0)
 
-                    result["campaigns"] = all_campaigns
-                    result["summary"] = {
-                        "total_spend": round(total_spend, 2),
-                        "total_impressions": total_impr,
-                        "total_clicks": total_clicks,
-                        "active_campaigns": active,
-                        "avg_ctr": round(total_clicks / total_impr * 100, 2) if total_impr else 0,
-                    }
-                    result["ad_account_name"] = (
-                        api_data[0]["account_name"] if len(api_data) == 1
-                        else f"{len(api_data)} accounts"
-                    )
-                    result["ad_account_id"] = api_data[0]["account_id"] if len(api_data) == 1 else None
-                    print(f"  ✓ {len(all_campaigns)} campaigns, ${total_spend:.2f} total spend")
-                    return result
-                else:
-                    print("  Meta API returned no data — falling back to DOM")
+                result["campaigns"] = all_campaigns
+                result["summary"] = {
+                    "total_spend": round(total_spend, 2),
+                    "total_impressions": total_impr,
+                    "total_clicks": total_clicks,
+                    "active_campaigns": active,
+                    "avg_ctr": round(total_clicks / total_impr * 100, 2) if total_impr else 0,
+                }
+                result["ad_account_name"] = (
+                    api_data[0]["account_name"] if len(api_data) == 1
+                    else f"{len(api_data)} accounts"
+                )
+                result["ad_account_id"] = api_data[0]["account_id"] if len(api_data) == 1 else None
+                print(f"  ✓ {len(all_campaigns)} campaigns, ${total_spend:.2f} total spend")
+                return result
             else:
-                print("  No token found — falling back to DOM scrape")
+                print("  Meta API returned no data — falling back to DOM")
+        else:
+            print("  No token found — falling back to DOM scrape")
 
-            # ── Strategy 4: DOM scrape ────────────────────────────────────
-            await asyncio.sleep(3)
+        # ── Strategy 4: DOM scrape (open fresh connection) ─────────────────
+        await asyncio.sleep(3)
+        async with websockets.connect(
+            ws_url, ping_interval=None, open_timeout=15, close_timeout=5
+        ) as ws:
+            await cdp_send(ws, "Runtime.enable")
             dom_raw = await cdp_eval(ws, DOM_EXTRACT_JS)
             if dom_raw:
                 try:
