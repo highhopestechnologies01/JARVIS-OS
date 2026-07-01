@@ -794,8 +794,20 @@ DOM_EXTRACT_JS = r"""
             }
         }
 
+        // Extract total spend summary from page footer (e.g. "$422.55 Total spent")
+        var totalSpend = null;
+        var totalMatch = bodyText.match(/\$([\d,]+\.?\d*)\s*\n?Total spent/i);
+        if (!totalMatch) { totalMatch = bodyText.match(/Total spent\s*\n?\$([\d,]+\.?\d*)/i); }
+        if (totalMatch) { totalSpend = totalMatch[1].replace(/,/g,''); }
+
+        // Count of campaigns from summary row
+        var campaignCount = null;
+        var countMatch = bodyText.match(/Results from (\d+) campaigns?/i);
+        if (countMatch) { campaignCount = parseInt(countMatch[1]); }
+
         if (parsedCampaigns.length > 0) {
             return JSON.stringify({found:true, source:'body_text', campaigns:parsedCampaigns,
+                totalSpend:totalSpend, campaignCount:campaignCount,
                 accountId:accountId, url:location.href});
         }
 
@@ -1114,20 +1126,14 @@ async def scrape_profile(profile: dict) -> dict:
                 ws_url, ping_interval=None, open_timeout=15, close_timeout=5
             ) as ws:
                 await cdp_send(ws, "Runtime.enable")
-                # Scroll through the campaign table to force virtual rows to render
-                scroll_js = """(async function() {
-                    for (var i = 0; i < 15; i++) {
-                        window.scrollTo(0, document.body.scrollHeight);
-                        await new Promise(r => setTimeout(r, 250));
-                        window.scrollTo(0, i * 600);
-                        await new Promise(r => setTimeout(r, 150));
-                    }
-                    window.scrollTo(0, 0);
-                    await new Promise(r => setTimeout(r, 300));
-                    return document.body.innerText.length;
-                })()"""
+                # Scroll through the campaign table in steps to expose more virtual rows
                 try:
-                    body_len_after = await cdp_eval(ws, scroll_js, await_promise=True, timeout=15)
+                    for step in range(0, 12000, 700):
+                        await cdp_eval(ws, f"(function(){{window.scrollTo(0,{step});return 1;}})()")
+                        await asyncio.sleep(0.25)
+                    await cdp_eval(ws, "(function(){window.scrollTo(0,0);return 1;})()")
+                    await asyncio.sleep(0.5)
+                    body_len_after = await cdp_eval(ws, "(function(){return document.body.innerText.length;})()")
                     print(f"  Scroll-loaded body length: {body_len_after}")
                 except Exception as se:
                     print(f"  Scroll error (continuing): {se}")
@@ -1144,7 +1150,15 @@ async def scrape_profile(profile: dict) -> dict:
                         campaigns, summary = parse_dom_campaigns(dom.get("campaigns", []))
                         result["campaigns"] = campaigns
                         result["summary"] = summary
-                        print(f"  DOM: {len(campaigns)} campaigns from {dom.get('source','?')}")
+                        # Inject page-footer total spend if available (covers all 35 campaigns)
+                        if dom.get("totalSpend"):
+                            summary["total_spend_all"] = float(dom["totalSpend"])
+                            print(f"  Total spend (all campaigns): ${dom['totalSpend']}")
+                        if dom.get("campaignCount"):
+                            summary["total_campaigns"] = dom["campaignCount"]
+                        print(f"  DOM: {len(campaigns)} campaigns from {dom.get('source','?')} "
+                              f"(page total: {dom.get('campaignCount','?')} campaigns, "
+                              f"${dom.get('totalSpend','?')} spent)")
                     else:
                         url = dom.get("url", "")
                         body_text = dom.get("bodyText", "")
