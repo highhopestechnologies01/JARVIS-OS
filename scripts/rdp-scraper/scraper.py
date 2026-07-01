@@ -213,28 +213,33 @@ JS_INSTALL_OVERRIDE = r"""
 (function() {
     if (window.__jarvis_override_installed) return 'already_installed';
     window.__jarvis_captured_token = null;
+    window.__jarvis_all_tokens = [];
     window.__jarvis_override_installed = true;
 
     function capture(url, headers) {
         try {
             if (!url || !url.includes('graph.facebook.com')) return;
+            var found = null;
             // From URL param
             try {
                 var u = new URL(url);
                 var t = u.searchParams.get('access_token');
-                if (t && t.length > 30) { window.__jarvis_captured_token = t; return; }
+                if (t && t.length > 30) { found = t; }
             } catch(e) {}
             // From Authorization header
-            function checkAuth(h) {
-                if (!h) return;
-                var auth = (typeof h.get === 'function') ? h.get('Authorization') : h['Authorization'];
-                if (!auth) auth = (typeof h.get === 'function') ? h.get('authorization') : h['authorization'];
+            if (!found && headers) {
+                var auth = (typeof headers.get === 'function') ?
+                    (headers.get('Authorization') || headers.get('authorization')) :
+                    (headers['Authorization'] || headers['authorization']);
                 if (auth && auth.startsWith('Bearer ')) {
-                    var t = auth.substring(7);
-                    if (t.length > 30) { window.__jarvis_captured_token = t; }
+                    var t2 = auth.substring(7);
+                    if (t2.length > 30) { found = t2; }
                 }
             }
-            checkAuth(headers);
+            if (found && !window.__jarvis_all_tokens.includes(found)) {
+                window.__jarvis_all_tokens.push(found);
+                window.__jarvis_captured_token = found;
+            }
         } catch(e) {}
     }
 
@@ -617,117 +622,97 @@ async def scrape_profile(profile: dict) -> dict:
 
         token = None
 
-        # ── Strategy 1: Service worker CDP interception ───────────────────
-        # The SW (www-service-worker.js) is what actually calls graph.facebook.com
-        # with real auth. Connect to SW's CDP, enable Network events, trigger
-        # a page UI action, and capture the token from SW network events.
-        sw_ws_url = await find_sw_ws_url(debug_port)
+        # ── Strategy 1: Wake SW via page trigger, then intercept SW's API calls ──
+        # Chrome terminates idle service workers. Correct order:
+        #   1) Trigger page UI → page fetch wakes the SW
+        #   2) Poll for SW to appear in CDP target list
+        #   3) Connect to SW, enable Network, trigger again, capture token
+
+        print("  Step 1: Triggering page to wake service worker...")
+        try:
+            async with websockets.connect(
+                ws_url, ping_interval=None, open_timeout=15, close_timeout=5
+            ) as pw:
+                await cdp_send(pw, "Runtime.enable")
+                await cdp_eval(pw, JS_INSTALL_OVERRIDE)
+                trigger = await cdp_eval(pw, JS_TRIGGER_REFRESH)
+                print(f"  Page trigger: {trigger}")
+        except Exception as e:
+            print(f"  Page trigger error: {e}")
+
+        # Poll for SW to appear (up to 5s after trigger)
+        print("  Step 2: Polling for service worker target (5s)...")
+        sw_ws_url = None
+        for attempt in range(10):
+            sw_ws_url = await find_sw_ws_url(debug_port)
+            if sw_ws_url:
+                print(f"  SW found after {attempt * 0.5:.1f}s")
+                break
+            await asyncio.sleep(0.5)
 
         if sw_ws_url:
-            print("  Connecting to service worker CDP session...")
+            print("  Step 3: Connecting to SW CDP, enabling Network...")
             try:
                 async with websockets.connect(
                     sw_ws_url, ping_interval=None, open_timeout=10, close_timeout=3
                 ) as sw_ws:
                     await cdp_send(sw_ws, "Network.enable")
-                    print("  SW network monitoring active. Triggering UI to force API call...")
+                    print("  SW network monitoring active. Triggering page again...")
 
-                    # Connect to page and trigger UI refresh concurrently
-                    async def trigger_page():
-                        await asyncio.sleep(0.5)
-                        try:
-                            async with websockets.connect(
-                                ws_url, ping_interval=None, open_timeout=10, close_timeout=3
-                            ) as pw:
-                                await cdp_send(pw, "Runtime.enable")
-                                r = await cdp_eval(pw, JS_TRIGGER_REFRESH)
-                                print(f"  Page trigger: {r}")
-                                # Also install JS override on page for its own calls
-                                await cdp_eval(pw, JS_INSTALL_OVERRIDE)
-                        except Exception as te:
-                            print(f"  Page trigger error: {te}")
-
-                    trigger_task = asyncio.create_task(trigger_page())
-                    token = await listen_for_graph_token(sw_ws, timeout=30.0)
-                    await asyncio.gather(trigger_task, return_exceptions=True)
-
-            except Exception as e:
-                print(f"  SW connection failed: {e}")
-
-        # ── Strategy 2: Page JS override + page Network events ────────────
-        # If SW interception didn't work, try from the page context
-        if not token:
-            print("  SW interception failed — trying page-level capture...")
-            async with websockets.connect(
-                ws_url, ping_interval=None, open_timeout=15, close_timeout=5
-            ) as ws:
-                await cdp_send(ws, "Runtime.enable")
-                await cdp_send(ws, "Network.enable")
-                await cdp_eval(ws, JS_INSTALL_OVERRIDE)
-
-                trigger_result = await cdp_eval(ws, JS_TRIGGER_REFRESH)
-                print(f"  Page trigger: {trigger_result}")
-
-                deadline = asyncio.get_event_loop().time() + 25.0
-                while asyncio.get_event_loop().time() < deadline:
+                    # Trigger page again so SW makes fresh API calls while we listen
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        data = json.loads(raw)
-                    except asyncio.TimeoutError:
-                        captured = await cdp_eval(ws, "window.__jarvis_captured_token || ''")
-                        if captured and len(captured) > 50:
-                            token = captured
-                            print(f"  ✓ Token via JS override ({len(token)} chars)")
-                            break
-                        continue
+                        async with websockets.connect(
+                            ws_url, ping_interval=None, open_timeout=10, close_timeout=3
+                        ) as pw2:
+                            await cdp_send(pw2, "Runtime.enable")
+                            await cdp_eval(pw2, JS_TRIGGER_REFRESH)
                     except Exception:
-                        break
+                        pass
 
-                    method = data.get("method", "")
-                    params = data.get("params", {})
-                    if method == "Network.requestWillBeSent":
-                        url = params.get("request", {}).get("url", "")
-                        if "graph.facebook.com" in url and "access_token=" in url:
-                            parsed = urlparse(url)
-                            qs = parse_qs(parsed.query)
-                            if "access_token" in qs:
-                                candidate = qs["access_token"][0]
-                                if len(candidate) > 50:
-                                    token = candidate
-                                    print(f"  ✓ Token from page Network event ({len(token)} chars)")
-                                    break
+                    # Listen for SW's real graph.facebook.com calls (25s)
+                    token = await listen_for_graph_token(sw_ws, timeout=25.0)
+            except Exception as e:
+                print(f"  SW connection error: {e}")
+        else:
+            print("  SW not found after trigger — SW may be dormant or not used by this profile")
 
-        # ── Strategy 3: Try ALL EAA tokens from page memory ──────────────
-        # The script-tag tokens are SDK/client tokens (code 1 error) but
-        # there might be more — try all of them with a quick /me check
+        # ── Strategy 2: Page JS override (page's own fetches to graph.facebook.com) ──
         if not token:
-            print("  Trying all EAA tokens from page memory...")
-            async with websockets.connect(
-                ws_url, ping_interval=None, open_timeout=15, close_timeout=5
-            ) as ws:
-                await cdp_send(ws, "Runtime.enable")
-                raw_tokens = await cdp_eval(ws, JS_EXTRACT_ALL_TOKENS)
-                if raw_tokens:
-                    try:
-                        all_tokens = json.loads(raw_tokens)
-                        print(f"  Found {len(all_tokens)} EAA tokens: {[t[:15]+'...' for t in all_tokens[:5]]}")
-                        async with httpx.AsyncClient(timeout=10.0) as hclient:
-                            for t in all_tokens:
-                                me_r = await hclient.get(
-                                    "https://graph.facebook.com/v19.0/me",
-                                    params={"access_token": t, "fields": "id,name"},
-                                )
-                                me_data = me_r.json()
-                                if "error" not in me_data:
-                                    token = t
-                                    print(f"  ✓ Valid user token found: {me_data.get('name')} ({len(t)} chars)")
-                                    break
-                                else:
-                                    code = me_data.get("error", {}).get("code")
-                                    if code != 1:  # Code 1 = invalid; other codes = different issue
-                                        print(f"  Token {t[:20]}... → code {code} (might be valid with right perms)")
-                    except Exception as e:
-                        print(f"  Token scan error: {e}")
+            print("  Checking page JS override for captured tokens...")
+            try:
+                async with websockets.connect(
+                    ws_url, ping_interval=None, open_timeout=15, close_timeout=5
+                ) as ws:
+                    await cdp_send(ws, "Runtime.enable")
+                    # Collect ALL unique tokens captured since override was installed
+                    all_captured = await cdp_eval(ws, """
+                        (function() {
+                            var t = window.__jarvis_captured_token || '';
+                            var all = window.__jarvis_all_tokens || [];
+                            if (t && !all.includes(t)) all.push(t);
+                            return JSON.stringify(all.filter(function(x){ return x && x.length > 50; }));
+                        })()
+                    """)
+                    if all_captured:
+                        captured_list = json.loads(all_captured)
+                        if captured_list:
+                            print(f"  Page captured {len(captured_list)} token(s) — validating...")
+                            async with httpx.AsyncClient(timeout=10.0) as hc:
+                                for ct in captured_list:
+                                    me_r = await hc.get(
+                                        "https://graph.facebook.com/v19.0/me",
+                                        params={"access_token": ct, "fields": "id,name"},
+                                    )
+                                    me_d = me_r.json()
+                                    if "error" not in me_d:
+                                        token = ct
+                                        print(f"  ✓ Valid token from page: {me_d.get('name')} ({len(ct)} chars)")
+                                        break
+                                    else:
+                                        code = me_d.get("error", {}).get("code", "?")
+                                        print(f"  Page token {ct[:20]}... → code {code}")
+            except Exception as e:
+                print(f"  Page capture check error: {e}")
 
         # ── Use token with Meta Marketing API ─────────────────────────────
         if token:
