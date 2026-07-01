@@ -139,7 +139,7 @@ services:
       DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
       GENERIC_TIMEZONE: America/New_York
     ports:
-      - "127.0.0.1:5678:5678"   # Tailscale-accessible only
+      - "127.0.0.1:5678:5677"   # host:5678 → container:5677 (n8n actual listening port)
     volumes:
       - n8n-data:/home/node/.n8n
       - ../n8n/workflows:/home/node/.n8n/workflows:ro
@@ -149,7 +149,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5678/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:5677/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
