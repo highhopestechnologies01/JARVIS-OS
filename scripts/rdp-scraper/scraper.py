@@ -1,5 +1,5 @@
 """
-JARVIS Meta Ads Scraper — runs on RDP machines (Windows).
+JARVIS Meta Ads Scraper v3 — runs on RDP machines (Windows).
 
 Strategy:
   1. Query Ads Power local API for active browser profiles
@@ -701,18 +701,86 @@ DOM_EXTRACT_JS = r"""
                     accountId:accountId, url:location.href});
         }
 
-        // --- Strategy D: full body text with spend pattern extraction ---
+        // --- Strategy D: body text campaign parser ---
         var bodyText = document.body.innerText || '';
-        // Look for $ amounts — these are spend values
         var spendMatches = bodyText.match(/\$[\d,]+\.?\d*/g) || [];
-        // Get a large chunk of body text to return for analysis
+
+        // After the last column header "Cost per resu[lt]", campaign rows follow:
+        // each row is: name → status → metrics
+        var STATUS_WORDS = ['Active','Not delivering','Inactive','Off','Paused','Scheduled','Learning','Error','Pending review'];
+        var headerIdx = bodyText.indexOf('Cost per resu');
+        var parsedCampaigns = [];
+
+        if (headerIdx >= 0) {
+            var afterHeaders = bodyText.slice(headerIdx + 15);
+            var lines = afterHeaders.split('\n')
+                .map(function(l){ return l.trim(); })
+                .filter(function(l){ return l.length > 0; });
+
+            var UI_CHROME = ['Compare','Export','Create','Duplicate','Edit','Analyze','A/B test','More',
+                             'Actions','Breakdown','Reports','Columns','See more','All ads',
+                             'Had delivery','Active ads','Open Dropdown','Search to filter','Campaigns',
+                             'Ad sets','Ads','Settings','Create a view','Review and publish','Menu'];
+            function isUiChrome(s) {
+                for (var ci = 0; ci < UI_CHROME.length; ci++) { if (s === UI_CHROME[ci]) return true; }
+                return s.length <= 1;
+            }
+            function isStatus(s) {
+                for (var si = 0; si < STATUS_WORDS.length; si++) {
+                    if (s.indexOf(STATUS_WORDS[si]) === 0) return true;
+                }
+                return false;
+            }
+
+            var i = 0;
+            while (i < lines.length && parsedCampaigns.length < 30) {
+                var l = lines[i];
+                if (isUiChrome(l)) { i++; continue; }
+                // Find next non-chrome line
+                var j = i + 1;
+                while (j < lines.length && isUiChrome(lines[j])) j++;
+                var nextMeaningful = j < lines.length ? lines[j] : '';
+
+                if (nextMeaningful && isStatus(nextMeaningful) && l.length >= 3 && !isStatus(l)) {
+                    var name = l;
+                    var status = nextMeaningful;
+                    var spend = '';
+                    var results = '';
+                    // Scan next 15 lines for $ metrics
+                    var end = Math.min(j + 15, lines.length);
+                    var spendCount = 0;
+                    for (var k = j + 1; k < end; k++) {
+                        var ml = lines[k];
+                        if (isStatus(ml) && ml !== status) break; // next campaign
+                        if (ml.match(/^\$[\d,]+\.?\d*$/)) {
+                            if (spendCount === 0) { results = ml; spendCount++; }
+                            else if (spendCount === 1) { spend = ml; spendCount++; break; }
+                        } else if (!results && ml.match(/^[\d,]+$/) && parseInt(ml.replace(/,/g,''),10) > 0) {
+                            results = ml;
+                        }
+                    }
+                    parsedCampaigns.push({name:name, status:status, spend:spend, results:results});
+                    i = end;
+                } else {
+                    i++;
+                }
+            }
+        }
+
+        if (parsedCampaigns.length > 0) {
+            return JSON.stringify({found:true, source:'body_text', campaigns:parsedCampaigns,
+                accountId:accountId, url:location.href});
+        }
+
+        // Return raw text for further diagnosis
         return JSON.stringify({
             found: false,
             url: location.href,
             title: document.title,
             bodyLength: bodyText.length,
             spendAmounts: spendMatches.slice(0, 20),
-            bodyText: bodyText.slice(0, 3000),
+            bodyText: bodyText.slice(0, 2000),
+            afterHeaders: headerIdx >= 0 ? bodyText.slice(headerIdx, headerIdx + 1500) : 'NOT_FOUND',
             accountId: accountId,
         });
     } catch(e) {
@@ -1035,7 +1103,7 @@ async def main():
     adspower_url = config.get("adspower_url", "http://localhost:50325")
     max_concurrent = config.get("max_concurrent_profiles", 3)
 
-    print(f"=== JARVIS Meta Ads Scraper — {rdp_host} ===")
+    print(f"=== JARVIS Meta Ads Scraper v3 — {rdp_host} ===")
     print(f"Hermes: {hermes_url}")
 
     fixed_ports = config.get("fixed_ports", [])
