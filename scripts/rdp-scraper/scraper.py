@@ -142,12 +142,12 @@ async def cdp_send(ws, method: str, params: dict = None) -> dict:
             break
     return {}
 
-async def cdp_eval(ws, js: str) -> str | None:
+async def cdp_eval(ws, js: str, await_promise: bool = False, timeout: int = 10) -> str | None:
     result = await cdp_send(ws, "Runtime.evaluate", {
         "expression": js,
         "returnByValue": True,
-        "awaitPromise": False,
-        "timeout": 10000,
+        "awaitPromise": await_promise,
+        "timeout": timeout * 1000,
     })
     val = result.get("result", {})
     if val.get("type") == "string":
@@ -1114,6 +1114,23 @@ async def scrape_profile(profile: dict) -> dict:
                 ws_url, ping_interval=None, open_timeout=15, close_timeout=5
             ) as ws:
                 await cdp_send(ws, "Runtime.enable")
+                # Scroll through the campaign table to force virtual rows to render
+                scroll_js = """(async function() {
+                    for (var i = 0; i < 15; i++) {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        await new Promise(r => setTimeout(r, 250));
+                        window.scrollTo(0, i * 600);
+                        await new Promise(r => setTimeout(r, 150));
+                    }
+                    window.scrollTo(0, 0);
+                    await new Promise(r => setTimeout(r, 300));
+                    return document.body.innerText.length;
+                })()"""
+                try:
+                    body_len_after = await cdp_eval(ws, scroll_js, await_promise=True, timeout=15)
+                    print(f"  Scroll-loaded body length: {body_len_after}")
+                except Exception as se:
+                    print(f"  Scroll error (continuing): {se}")
                 dom_raw = await cdp_eval(ws, DOM_EXTRACT_JS)
                 if dom_raw:
                     try:
