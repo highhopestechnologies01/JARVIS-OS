@@ -29,10 +29,11 @@
     {
       "parameters": {
         "conditions": {
-          "boolean": [
+          "number": [
             {
-              "value1": "={{ $json.has_failures }}",
-              "value2": true
+              "value1": "={{ $json.failures.length }}",
+              "operation": "larger",
+              "value2": 0
             }
           ]
         }
