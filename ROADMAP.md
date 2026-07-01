@@ -272,3 +272,29 @@ Mac environment fully configured.
 - Run: bash /opt/jarvis-repo/scripts/activate-workflows-4-5.sh on VPS
 - Test workflow 4 (daily briefing push) manually
 - Add Twilio SMS or tighten Telegram notification routing
+
+### Session Report — 2026-07-01 (n8n Dynamic Bodies + All 5 Workflows Live)
+#### Completed
+- Root cause found: n8n v2.x executes from `workflow_history` (not `workflow_entity.nodes`)
+  - Direct psql UPDATEs to workflow_entity only update the "draft" — n8n runs the "published" version
+  - Fix: must update workflow_history + workflow_published_version + workflow_entity.activeVersionId
+- Fixed IF node routing: boolean expression coercion in n8n v2.x causes `{{ $json.has_failures }} == true` to always fail
+  - Fix: switched to number comparison `$json.failure_count > 0` (unambiguous, no type coercion)
+- Fixed webhook node: downgraded to typeVersion 1.1 for deterministic `$json.body` structure
+- All 5 workflows now fully activated with published versions: wf1✅ wf2✅ wf3✅ wf4✅ wf5✅
+- Confirmed end-to-end: health alert webhook → Code node → IF TRUE → health_alert stored in Hermes ✅
+- Dashboard PORT fix deployed: PORT=3000 override in docker-compose.yml environment block
+- Rewrote activate-workflows-4-5.sh to update all three n8n v2 tables correctly
+#### Files Modified
+- n8n/workflows/01-health-alert.json (webhook v1.1, failure_count IF condition, dynamic bodies)
+- scripts/activate-workflows-4-5.sh (complete rewrite — handles workflow_history + published_version)
+- ROADMAP.md
+#### Errors / Blockers
+- n8n v2 workflow_history discovery: took many iterations to find root cause
+- workflow_history INSERT requires non-null `authors` column (get from existing record)
+- workflow_entity.activeVersionId must be set for schedule-trigger workflows to activate
+#### Next Session Priority
+- Test wf4 (daily briefing push) by manually triggering: POST /api/v1/scheduler/trigger/daily_briefing
+- Verify wf2 (github activity) and wf3 (metrics snapshot) execute with dynamic content
+- Check dashboard health status
+- Consider Telegram notification routing improvements
