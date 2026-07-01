@@ -868,70 +868,73 @@ async def scrape_profile(profile: dict) -> dict:
         tabs = await cdp_get_tabs(debug_port)
         print(f"  {len(tabs)} tabs open")
 
-        # ── Pick best tab: adsmanager.facebook.com preferred ─────────────
-        # Accept any authenticated Facebook tab (not login/error)
-        ads_tab = None
-        for t in tabs:
-            url = t.get("url", "")
-            if "adsmanager.facebook.com" in url and not is_bad_url(url):
-                ads_tab = t
-                print(f"  Found Ads Manager tab: {url[:80]}")
-                break
+        # ── Collect ALL Ads Manager tabs (try each account, skip empty ones) ──
+        ads_tabs = [t for t in tabs
+                    if "adsmanager.facebook.com" in t.get("url", "")
+                    and not is_bad_url(t.get("url", ""))]
 
-        if not ads_tab:
-            for t in tabs:
-                url = t.get("url", "")
-                if "facebook.com" in url and not is_bad_url(url):
-                    ads_tab = t
-                    print(f"  Using Facebook tab: {url[:80]}")
-                    break
+        # Fallback: any authenticated Facebook tab
+        if not ads_tabs:
+            ads_tabs = [t for t in tabs
+                        if "facebook.com" in t.get("url", "")
+                        and not is_bad_url(t.get("url", ""))]
 
-        if not ads_tab:
+        if not ads_tabs:
             fb_urls = [t.get("url", "")[:60] for t in tabs if "facebook.com" in t.get("url", "")]
             result["error"] = f"No usable Facebook tab (all login/blocked): {fb_urls}"
             print(f"  Skipping — all Facebook tabs are login/blocked")
             print(f"  ACTION NEEDED: Open adsmanager.facebook.com in this profile manually")
             return result
 
-        ws_url = ads_tab.get("webSocketDebuggerUrl")
-        if not ws_url:
-            result["error"] = "No webSocketDebuggerUrl"
+        print(f"  Found {len(ads_tabs)} Ads Manager tab(s) — will try each")
+
+        # Try each tab; skip empty accounts, use first one with campaign data
+        ads_tab = None
+        for candidate in ads_tabs:
+            cand_url = candidate.get("url", "")
+            cand_ws = candidate.get("webSocketDebuggerUrl")
+            if not cand_ws:
+                continue
+            acct_ids = re.findall(r'act[_=](\d+)', cand_url)
+            print(f"  Checking tab: act={acct_ids} — {cand_url[:80]}")
+            try:
+                async with websockets.connect(
+                    cand_ws, ping_interval=None, open_timeout=10, close_timeout=3
+                ) as pw_check:
+                    await cdp_send(pw_check, "Runtime.enable")
+                    dismissed = await cdp_eval(pw_check, JS_DISMISS_MODALS)
+                    if dismissed and dismissed != "nothing_dismissed":
+                        print(f"    Dismissed modals: {dismissed}")
+                        await asyncio.sleep(1)
+                    state_raw = await cdp_eval(pw_check, JS_CHECK_PAGE_STATE)
+                    if state_raw:
+                        state = json.loads(state_raw)
+                        print(f"    State: empty={state.get('empty_account')}, "
+                              f"has_campaigns={state.get('has_campaign_keywords')}, "
+                              f"spends={state.get('spend_amounts','[]')}, "
+                              f"body_len={state.get('body_len')}")
+                        if state.get("empty_account") and not state.get("spend_amounts"):
+                            print(f"    SKIP: empty account")
+                            continue  # try next tab
+                    ads_tab = candidate
+                    break
+            except Exception as e:
+                print(f"    Page state check error: {e}")
+                ads_tab = candidate  # try it anyway
+                break
+
+        if not ads_tab:
+            result["error"] = "All Ads Manager tabs are empty accounts"
+            print(f"  All tabs are empty accounts — no campaign data")
             return result
 
+        ws_url = ads_tab.get("webSocketDebuggerUrl")
         current_url = ads_tab.get("url", "")
         print(f"  Connecting to tab: {current_url[:80]}")
 
-        # Extract account ID from URL (used for direct API fallback)
         account_ids_from_url = re.findall(r'act[_=](\d+)', current_url)
         if account_ids_from_url:
             print(f"  Account ID from URL: {account_ids_from_url}")
-
-        # ── Quick page state check before anything else ────────────────────
-        try:
-            async with websockets.connect(
-                ws_url, ping_interval=None, open_timeout=10, close_timeout=3
-            ) as pw_check:
-                await cdp_send(pw_check, "Runtime.enable")
-                # Dismiss any stale-session modals first
-                dismissed = await cdp_eval(pw_check, JS_DISMISS_MODALS)
-                if dismissed and dismissed != "nothing_dismissed":
-                    print(f"  Dismissed modals: {dismissed}")
-                    await asyncio.sleep(1)
-                # Check page state
-                state_raw = await cdp_eval(pw_check, JS_CHECK_PAGE_STATE)
-                if state_raw:
-                    state = json.loads(state_raw)
-                    print(f"  Page state: empty={state.get('empty_account')}, "
-                          f"stale={state.get('stale_session')}, "
-                          f"has_campaigns={state.get('has_campaign_keywords')}, "
-                          f"spends={state.get('spend_amounts','[]')}, "
-                          f"body_len={state.get('body_len')}")
-                    if state.get("empty_account"):
-                        result["error"] = "Empty account — no campaigns (showing onboarding screen)"
-                        print(f"  SKIP: Account has no campaigns (empty account page)")
-                        return result
-        except Exception as e:
-            print(f"  Page state check error: {e}")
 
         token = None
 
