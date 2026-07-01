@@ -275,6 +275,55 @@ JS_INSTALL_OVERRIDE = r"""
 })()
 """
 
+# ── JS: dismiss stale-session / error modals without reloading ───────────────
+
+JS_DISMISS_MODALS = r"""
+(function() {
+    var dismissed = [];
+    // Dismiss Facebook's "You've been away" / "sort timed out" / "connection lost" modals
+    // by clicking their "Close" button (NOT "Refresh" — that reloads the page)
+    var buttons = Array.from(document.querySelectorAll('[role="button"], button'));
+    for (var b of buttons) {
+        var txt = (b.textContent || b.innerText || '').trim();
+        if (txt === 'Close' || txt === '×' || txt === 'x') {
+            try { b.click(); dismissed.push('closed:' + txt); } catch(e) {}
+        }
+    }
+    // Also try aria-label dismiss buttons
+    var dismissBtns = document.querySelectorAll('[aria-label="Close"],[aria-label="Dismiss"],[aria-label="close"]');
+    for (var d of dismissBtns) {
+        try { d.click(); dismissed.push('aria:closed'); } catch(e) {}
+    }
+    return dismissed.join(',') || 'nothing_dismissed';
+})()
+"""
+
+# ── JS: quick page state check — is there actual campaign data? ───────────────
+
+JS_CHECK_PAGE_STATE = r"""
+(function() {
+    var t = document.body.innerText || '';
+    var hasEmpty = t.includes('Get set up to run ads') ||
+                   t.includes('publish your first ad campaign') ||
+                   t.includes('No campaigns') ||
+                   t.includes('No results');
+    var hasStale = t.includes("You've been away") ||
+                   t.includes('sort request timed out') ||
+                   t.includes('internet connection was lost');
+    var hasCampaigns = t.includes('Active') || t.includes('Not delivering') ||
+                       t.includes('Paused') || t.includes('Inactive');
+    var spends = (t.match(/\$[\d,]+\.?\d*/g) || []);
+    return JSON.stringify({
+        empty_account: hasEmpty,
+        stale_session: hasStale,
+        has_campaign_keywords: hasCampaigns,
+        spend_amounts: spends.slice(0, 10),
+        body_len: t.length,
+        url: location.href
+    });
+})()
+"""
+
 # ── JS: trigger UI refresh to cause new API calls ────────────────────────────
 
 JS_TRIGGER_REFRESH = r"""
@@ -291,30 +340,8 @@ JS_TRIGGER_REFRESH = r"""
         if (campaignLink) { campaignLink.click(); results.push('clicked:campaigns'); }
     } catch(e) {}
 
-    // 2. Click "Today" preset in date selector
-    try {
-        var todayBtn = Array.from(document.querySelectorAll('[role="option"], [role="button"], button')).find(function(b) {
-            var txt = (b.textContent || '').trim();
-            return txt === 'Today' || txt === 'Last 7 days';
-        });
-        if (todayBtn) { todayBtn.click(); results.push('clicked:today'); }
-    } catch(e) {}
-
-    // 3. Click date range button to open picker (triggers data load on close)
-    try {
-        var dateBtn = document.querySelector('[data-testid="date-range-selector"]') ||
-                      document.querySelector('[aria-label*="date range"]') ||
-                      document.querySelector('[aria-label*="Date range"]');
-        if (dateBtn) { dateBtn.click(); results.push('clicked:date_range'); }
-    } catch(e) {}
-
-    // 4. Click any visible filter or column header to force table reload
-    try {
-        var colHeader = document.querySelector('[role="columnheader"]');
-        if (colHeader) { colHeader.click(); results.push('clicked:column'); }
-    } catch(e) {}
-
-    // 5. Scroll to trigger lazy-load
+    // NOTE: Do NOT click column headers — causes "sort request timed out" on stale sessions
+    // Just scroll to trigger lazy-load
     window.scrollBy(0, 100);
     window.scrollBy(0, -100);
     results.push('scrolled');
@@ -878,6 +905,33 @@ async def scrape_profile(profile: dict) -> dict:
         account_ids_from_url = re.findall(r'act[_=](\d+)', current_url)
         if account_ids_from_url:
             print(f"  Account ID from URL: {account_ids_from_url}")
+
+        # ── Quick page state check before anything else ────────────────────
+        try:
+            async with websockets.connect(
+                ws_url, ping_interval=None, open_timeout=10, close_timeout=3
+            ) as pw_check:
+                await cdp_send(pw_check, "Runtime.enable")
+                # Dismiss any stale-session modals first
+                dismissed = await cdp_eval(pw_check, JS_DISMISS_MODALS)
+                if dismissed and dismissed != "nothing_dismissed":
+                    print(f"  Dismissed modals: {dismissed}")
+                    await asyncio.sleep(1)
+                # Check page state
+                state_raw = await cdp_eval(pw_check, JS_CHECK_PAGE_STATE)
+                if state_raw:
+                    state = json.loads(state_raw)
+                    print(f"  Page state: empty={state.get('empty_account')}, "
+                          f"stale={state.get('stale_session')}, "
+                          f"has_campaigns={state.get('has_campaign_keywords')}, "
+                          f"spends={state.get('spend_amounts','[]')}, "
+                          f"body_len={state.get('body_len')}")
+                    if state.get("empty_account"):
+                        result["error"] = "Empty account — no campaigns (showing onboarding screen)"
+                        print(f"  SKIP: Account has no campaigns (empty account page)")
+                        return result
+        except Exception as e:
+            print(f"  Page state check error: {e}")
 
         token = None
 
