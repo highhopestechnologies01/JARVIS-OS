@@ -38,7 +38,7 @@ def load_config() -> dict:
     if not CONFIG_PATH.exists():
         print("[ERROR] config.json not found.")
         raise SystemExit(1)
-    with open(CONFIG_PATH, encoding="utf-8") as f:
+    with open(CONFIG_PATH, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM if present
         return json.load(f)
 
 # ── Ads Power / Port discovery ────────────────────────────────────────────────
