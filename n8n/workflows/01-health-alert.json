@@ -7,18 +7,18 @@
         "httpMethod": "POST",
         "path": "jarvis-health-alert",
         "responseMode": "onReceived",
-        "responseData": "allEntries"
+        "options": {}
       },
       "id": "webhook-trigger",
       "name": "Health Alert Webhook",
       "type": "n8n-nodes-base.webhook",
-      "typeVersion": 2,
+      "typeVersion": 1.1,
       "position": [240, 300],
       "webhookId": "jarvis-health-alert"
     },
     {
       "parameters": {
-        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst failures = body.failures || [];\nconst statuses = body.statuses || {};\nconst timestamp = new Date().toISOString();\n\nconst summary = failures.length > 0\n  ? `⚠️ ${failures.length} service(s) DOWN: ${failures.join(', ')}`\n  : '✅ All services healthy';\n\nconst allStatuses = Object.entries(statuses)\n  .map(([k,v]) => `${v === 'ok' ? '✓' : '✗'} ${k}: ${v}`)\n  .join('\\n');\n\nreturn [{\n  json: {\n    summary,\n    failures,\n    statuses,\n    all_statuses_text: allStatuses,\n    timestamp,\n    has_failures: failures.length > 0,\n    importance: failures.length > 0 ? 9 : 3\n  }\n}];"
+        "jsCode": "// Webhook v1.1 wraps data: $json.body = request body\nconst raw = $input.first().json;\nconst body = raw.body !== undefined ? raw.body : raw;\n\nconst failures = Array.isArray(body.failures) ? body.failures : [];\nconst statuses = body.statuses || {};\nconst timestamp = new Date().toISOString();\n\nconst summary = failures.length > 0\n  ? `ALERT: ${failures.length} service(s) DOWN: ${failures.join(', ')}`\n  : 'All services healthy';\n\nconst allStatuses = Object.entries(statuses)\n  .map(([k,v]) => `${v === 'ok' ? 'OK' : 'DOWN'} ${k}: ${v}`)\n  .join('\\n');\n\nreturn [{\n  json: {\n    summary,\n    failures,\n    statuses,\n    all_statuses_text: allStatuses || 'No status data',\n    timestamp,\n    failure_count: failures.length,\n    has_failures: failures.length > 0,\n    importance: failures.length > 0 ? 9 : 2\n  }\n}];"
       },
       "id": "format-alert",
       "name": "Format Alert",
@@ -31,7 +31,7 @@
         "conditions": {
           "number": [
             {
-              "value1": "={{ $json.failures.length }}",
+              "value1": "={{ $json.failure_count }}",
               "operation": "larger",
               "value2": 0
             }
@@ -57,7 +57,7 @@
       "name": "Store Alert in Hermes Memory",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [900, 200]
+      "position": [900, 180]
     },
     {
       "parameters": {
@@ -72,7 +72,7 @@
       "name": "Log Event to Hermes",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [900, 400]
+      "position": [900, 420]
     }
   ],
   "connections": {
