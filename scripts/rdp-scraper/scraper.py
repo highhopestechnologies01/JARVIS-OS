@@ -1074,15 +1074,20 @@ async def scrape_profile(profile: dict) -> dict:
                     else:
                         url = dom.get("url", "")
                         body_text = dom.get("bodyText", "")
+                        after_headers = dom.get("afterHeaders", "")
                         spend_amounts = dom.get("spendAmounts", [])
                         result["error"] = f"DOM no table. URL={url}"
                         print(f"  DOM failed. URL: {url}")
                         print(f"  Body length: {dom.get('bodyLength', 0)}")
                         if spend_amounts:
                             print(f"  Spend amounts in DOM: {spend_amounts}")
-                        if body_text:
-                            # Print first 800 chars for diagnosis
-                            print(f"  Body text (first 800):\n{body_text[:800]}")
+                        # KEY: print what comes AFTER the column headers
+                        if after_headers and after_headers != "NOT_FOUND":
+                            print(f"  === AFTER HEADERS (1500 chars) ===\n{after_headers[:1500]}")
+                        elif after_headers == "NOT_FOUND":
+                            print("  'Cost per resu' column header NOT FOUND in body text")
+                            if body_text:
+                                print(f"  Body text tail (last 500):\n{body_text[-500:]}")
                 else:
                     result["error"] = "Empty DOM result"
 
