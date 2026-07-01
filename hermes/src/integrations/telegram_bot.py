@@ -58,7 +58,7 @@ async def _handle_status(chat_id: int) -> None:
     import httpx as _httpx
     services = {
         "hermes":     "http://localhost:8000/api/v1/health/ready",
-        "n8n":        "http://n8n-n8n-1:5678/healthz",
+        "n8n":        "http://jarvis-n8n:5677/healthz",
         "grafana":    "http://jarvis-grafana:3000/api/health",
         "prometheus": "http://jarvis-prometheus:9090/-/healthy",
     }
@@ -201,6 +201,95 @@ async def _handle_ads(chat_id: int) -> None:
     await _send(chat_id, "\n".join(lines))
 
 
+async def _handle_workflows(chat_id: int) -> None:
+    """Show recent n8n workflow activity stored in Hermes memory."""
+    from src.db.connection import AsyncSessionLocal
+    from src.db.models import Memory
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Memory)
+            .where(Memory.source.ilike("%n8n%"))
+            .order_by(Memory.created_at.desc())
+            .limit(6)
+        )
+        memories = result.scalars().all()
+
+    if not memories:
+        await _send(chat_id, "No n8n workflow activity recorded yet.")
+        return
+
+    lines = ["<b>⚙️ Recent n8n Activity</b>\n"]
+    for m in memories:
+        ts = m.created_at.strftime("%m/%d %H:%M") if m.created_at else "?"
+        preview = m.content[:180].replace("\n", " ")
+        lines.append(f"<b>{m.topic or m.type}</b> [{ts}]\n{preview}\n")
+
+    await _send(chat_id, "\n".join(lines))
+
+
+async def _handle_intel(chat_id: int) -> None:
+    """Show recent AI pattern insights."""
+    from src.db.connection import AsyncSessionLocal
+    from src.db.models import Memory
+    from sqlalchemy import select, or_
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Memory)
+            .where(or_(Memory.type == "pattern_insight", Memory.type == "weekly_plan"))
+            .order_by(Memory.created_at.desc())
+            .limit(4)
+        )
+        memories = result.scalars().all()
+
+    if not memories:
+        await _send(chat_id, "No AI insights yet. Pattern analysis runs at 3am daily.")
+        return
+
+    lines = ["<b>⚡ AI Insights</b>\n"]
+    for m in memories:
+        ts = m.created_at.strftime("%m/%d") if m.created_at else "?"
+        lines.append(f"[{ts}] {m.content[:300]}\n")
+
+    await _send(chat_id, "\n".join(lines))
+
+
+_RUN_JOBS = {
+    "briefing":  "daily_briefing",
+    "health":    "health_check",
+    "report":    "weekly_report",
+    "pattern":   "pattern_analysis",
+    "planning":  "autonomous_planning",
+    "memory":    "memory_consolidation",
+}
+
+
+async def _handle_run(chat_id: int, arg: str) -> None:
+    """Manually trigger a Hermes scheduler job by short name or ID."""
+    job_id = _RUN_JOBS.get(arg.lower(), arg.lower())
+    valid = ", ".join(sorted(_RUN_JOBS.keys()))
+
+    if job_id not in _RUN_JOBS.values():
+        await _send(chat_id, f"❓ Unknown job: <code>{arg}</code>\nValid: {valid}")
+        return
+
+    await _send(chat_id, f"⏳ Triggering <code>{job_id}</code>…")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"http://localhost:8000/api/v1/scheduler/trigger/{job_id}"
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                await _send(chat_id, f"✅ <b>{data.get('job_name', job_id)}</b> triggered.")
+            else:
+                await _send(chat_id, f"❌ HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        await _send(chat_id, f"❌ Error: {e}")
+
+
 async def _handle_ai(chat_id: int, text: str) -> None:
     """Pass free-text to Claude Haiku and reply."""
     from anthropic import AsyncAnthropic
@@ -227,6 +316,9 @@ HELP_TEXT = """<b>🤖 JARVIS Commands</b>
 /status — infrastructure health
 /briefing — today's executive briefing
 /memory — last 5 memory entries
+/workflows — recent n8n automation activity
+/intel — AI pattern insights
+/run &lt;job&gt; — trigger a job (briefing, health, report, pattern, planning, memory)
 /rdp — RDP machine statuses
 /ads — Meta Ads live summary
 /help — this message
@@ -271,6 +363,17 @@ async def process_updates() -> None:
             await _handle_briefing(chat_id)
         elif cmd == "/memory":
             await _handle_memory(chat_id)
+        elif cmd == "/workflows":
+            await _handle_workflows(chat_id)
+        elif cmd == "/intel":
+            await _handle_intel(chat_id)
+        elif cmd in ("/run", "/trigger"):
+            args = text.split()
+            if len(args) > 1:
+                await _handle_run(chat_id, args[1])
+            else:
+                valid = ", ".join(sorted(_RUN_JOBS.keys()))
+                await _send(chat_id, f"Usage: /run &lt;job&gt;\nValid jobs: {valid}")
         elif cmd == "/rdp":
             await _handle_rdp(chat_id)
         elif cmd == "/ads":

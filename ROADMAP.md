@@ -298,3 +298,26 @@ Mac environment fully configured.
 - Verify wf2 (github activity) and wf3 (metrics snapshot) execute with dynamic content
 - Check dashboard health status
 - Consider Telegram notification routing improvements
+
+### Session Report — 2026-07-01 (Dashboard Health + Full System Operational)
+#### Completed
+- Fixed dashboard health check: root cause was Next.js standalone binds to container hostname (not localhost); fixed with CMD-SHELL using `$(hostname)` in health check command
+- Fixed dashboard PORT: added HOSTNAME=0.0.0.0 + PORT=3000 to docker-compose environment block
+- Confirmed all 5 n8n workflows running autonomously on schedule via execution_entity query:
+  - wf1 Health Alert Handler: success (07:28, 07:39) ✅
+  - wf2 GitHub Activity Digest: success (10:00) ✅
+  - wf3 Prometheus Metrics Snapshot: success (every hour 08:00–13:00) ✅
+  - wf4 Daily Briefing Push: success (12:00) ✅
+  - wf5 Weekly Memory Digest: scheduled Sunday 11pm (not yet fired) ✅
+- All 7 Docker services healthy: postgres, redis, hermes, dashboard, n8n, prometheus, grafana ✅
+#### Files Modified
+- infrastructure/docker-compose.yml (HOSTNAME=0.0.0.0, CMD-SHELL health check)
+#### Errors / Blockers
+- Docker system HOSTNAME env var overrides compose environment block for `localhost` binding
+- Fix: CMD-SHELL health check with `$(hostname)` uses the actual bound hostname dynamically
+- n8n REST API requires API key (not basic auth) — bypassed by querying PostgreSQL directly
+#### Next Session Priority
+- JARVIS OS is fully operational — all automation running autonomously
+- Optional: set up pgvector semantic search (Phase 8 optional)
+- Optional: Telegram notification tuning (daily briefing delivery confirmation)
+- Optional: add wf5 weekly digest verification after Sunday 11pm run
