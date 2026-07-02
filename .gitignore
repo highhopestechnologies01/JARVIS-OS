@@ -64,3 +64,5 @@ infrastructure/grafana/data/
 
 # Postgres data
 infrastructure/postgres/data/
+hermes/static/
+static/

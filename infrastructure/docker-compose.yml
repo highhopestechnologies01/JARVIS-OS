@@ -88,6 +88,7 @@ services:
       retries: 3
       start_period: 30s
     volumes:
+      - ../hermes/static:/static
       - ../hermes/logs:/app/logs
 
   # ----------------------------------------------------------

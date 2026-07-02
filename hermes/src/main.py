@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
 
@@ -89,3 +90,9 @@ app.include_router(intelligence.router, prefix="/api/v1/intelligence", tags=["in
 app.include_router(coolify_routes.router)
 app.include_router(rdp_routes.router)
 app.include_router(meta_ads_routes.router)
+
+
+# Serve Meta Ads dashboard
+import os
+if os.path.isdir("/static"):
+    app.mount("/dashboard", StaticFiles(directory="/static", html=True), name="dashboard")
