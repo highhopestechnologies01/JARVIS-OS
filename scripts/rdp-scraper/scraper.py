@@ -1377,6 +1377,185 @@ async def scrape_profile_with_retry(profile: dict, retry_count: int = 2, retry_d
     return last_result
 
 
+# ── Campaign Command Execution ────────────────────────────────────────────────
+
+JS_TOGGLE_CAMPAIGN = """
+(function(campaignName, targetAction) {
+    var targetOn = (targetAction === 'ACTIVATE');
+
+    // Walk all text nodes to find exact or partial match
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    var node;
+    while (node = walker.nextNode()) {
+        var text = node.textContent.trim();
+        if (text === campaignName || text.indexOf(campaignName) !== -1) {
+            var el = node.parentElement;
+            // Walk up to find row (tr or role=row)
+            var row = null;
+            for (var i = 0; i < 12; i++) {
+                if (!el) break;
+                if (el.tagName === 'TR' || el.getAttribute('role') === 'row') {
+                    row = el;
+                    break;
+                }
+                el = el.parentElement;
+            }
+            if (!row) continue;
+
+            // Find toggle: input[checkbox] or role=switch or aria-checked button
+            var toggles = row.querySelectorAll(
+                'input[type="checkbox"], [role="switch"], [aria-checked], button.x1i10hfl'
+            );
+            if (toggles.length === 0) continue;
+
+            var toggle = toggles[0];
+            var isOn = false;
+            if (toggle.type === 'checkbox') {
+                isOn = toggle.checked;
+            } else {
+                isOn = toggle.getAttribute('aria-checked') === 'true';
+            }
+
+            if (isOn === targetOn) {
+                return JSON.stringify({ok: true, already: true, state: isOn ? 'on' : 'off'});
+            }
+
+            // Click the toggle
+            toggle.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+            return JSON.stringify({ok: true, clicked: true, from: isOn ? 'on' : 'off'});
+        }
+    }
+    return JSON.stringify({ok: false, error: 'campaign_not_found_in_dom'});
+})(%s, %s)
+"""
+
+
+async def toggle_campaign_via_cdp(debug_port: str, campaign_name: str, action: str) -> dict:
+    """
+    Connect to a Chrome debug port, find the Ads Manager tab, and click
+    the campaign's On/Off toggle via CDP Runtime.evaluate.
+    """
+    import websockets as _ws
+
+    try:
+        tabs = await cdp_get_tabs(debug_port)
+    except Exception as e:
+        return {"ok": False, "error": f"cdp_get_tabs failed: {e}"}
+
+    # Find an Ads Manager campaigns tab
+    am_tab = None
+    for tab in tabs:
+        url = tab.get("url", "")
+        if "adsmanager.facebook.com" in url and "campaigns" in url:
+            am_tab = tab
+            break
+
+    if not am_tab:
+        return {"ok": False, "error": "no_ads_manager_tab"}
+
+    ws_url = am_tab.get("webSocketDebuggerUrl")
+    if not ws_url:
+        return {"ok": False, "error": "no_ws_url"}
+
+    try:
+        async with _ws.connect(ws_url, ping_interval=None, close_timeout=5) as ws:
+            js = JS_TOGGLE_CAMPAIGN % (
+                json.dumps(campaign_name),
+                json.dumps(action),
+            )
+            raw = await cdp_eval(ws, js, timeout=15)
+            if raw:
+                result = json.loads(raw)
+                return result
+            return {"ok": False, "error": "no_result_from_js"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def execute_pending_commands(
+    hermes_url: str,
+    scraper_token: str,
+    rdp_host: str,
+    active_profiles: list[dict],
+) -> None:
+    """Fetch pending campaign commands from Hermes and execute them via CDP."""
+    headers = {"Content-Type": "application/json"}
+    if scraper_token:
+        headers["X-Scraper-Token"] = scraper_token
+
+    # Build profile_id → debug_port map
+    port_map: dict[str, str] = {
+        p["user_id"]: p["debug_port"] for p in active_profiles
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{hermes_url}/api/v1/meta-ads/commands/pending",
+                params={"rdp_host": rdp_host},
+                headers=headers,
+            )
+            if r.status_code != 200:
+                return
+            commands = r.json().get("commands", [])
+    except Exception as e:
+        print(f"[WARN] Could not fetch pending commands: {e}")
+        return
+
+    if not commands:
+        return
+
+    print(f"\n[Commands] {len(commands)} pending command(s) to execute")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for cmd in commands:
+            cmd_id = cmd["id"]
+            profile_id = cmd["profile_id"]
+            campaign_name = cmd["campaign_name"]
+            action = cmd["action"]
+
+            debug_port = port_map.get(profile_id)
+            if not debug_port:
+                # Try matching by port_XXXXX format too
+                for p in active_profiles:
+                    if p.get("name") == profile_id or p.get("user_id") == profile_id:
+                        debug_port = p["debug_port"]
+                        break
+
+            if not debug_port:
+                print(f"  [CMD] {action} '{campaign_name}' → profile {profile_id} not active, skipping")
+                await client.patch(
+                    f"{hermes_url}/api/v1/meta-ads/commands/{cmd_id}/result",
+                    json={"status": "failed", "error": f"profile {profile_id} not active on {rdp_host}"},
+                    headers=headers,
+                )
+                continue
+
+            print(f"  [CMD] {action} '{campaign_name}' via port {debug_port}...")
+            result = await toggle_campaign_via_cdp(debug_port, campaign_name, action)
+
+            if result.get("ok"):
+                if result.get("already"):
+                    status = "done"
+                    print(f"  [CMD] ✓ Already {result.get('state', 'set')}")
+                else:
+                    status = "done"
+                    print(f"  [CMD] ✓ Clicked toggle ({result.get('from')} → {action.lower()}d)")
+                await client.patch(
+                    f"{hermes_url}/api/v1/meta-ads/commands/{cmd_id}/result",
+                    json={"status": status},
+                    headers=headers,
+                )
+            else:
+                err = result.get("error", "unknown")
+                print(f"  [CMD] ✗ Failed: {err}")
+                await client.patch(
+                    f"{hermes_url}/api/v1/meta-ads/commands/{cmd_id}/result",
+                    json={"status": "failed", "error": err},
+                    headers=headers,
+                )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -1467,6 +1646,9 @@ async def main():
             print("✗ Telegram summary failed")
     else:
         print("[INFO] No telegram_bot_token/telegram_chat_id in config — skipping notification")
+
+    # ── Execute pending campaign commands (after regular scrape) ──────────────
+    await execute_pending_commands(hermes_url, scraper_token, rdp_host, profiles)
 
     print(f"=== Done in {elapsed:.0f}s ===")
 

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import useSWR from "swr";
 
-const HERMES = process.env.NEXT_PUBLIC_HERMES_URL || "http://localhost:8001";
+const HERMES = "";
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
 interface Campaign {
@@ -18,6 +18,7 @@ interface Campaign {
   cpm?: string;
   results?: string;
   reach?: string;
+  profile_id?: string;
   profile_name?: string;
   ad_account_name?: string;
   rdp_host?: string;
@@ -55,6 +56,7 @@ interface Summary {
   last_updated?: string;
   profiles: Profile[];
   stale: boolean;
+  date?: string;
 }
 
 interface Control {
@@ -75,6 +77,10 @@ function timeSince(iso?: string): string {
   return `${Math.floor(diff / 3600)}h ago`;
 }
 
+function todayStr(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
 function StatusDot({ status }: { status?: string }) {
   const s = (status || "").toLowerCase();
   const color =
@@ -88,21 +94,13 @@ function StatusDot({ status }: { status?: string }) {
       ? "bg-red-500"
       : "bg-jarvis-muted";
   return (
-    <span
-      className={`inline-block w-2 h-2 rounded-full ${color} mr-1.5 flex-shrink-0`}
-    />
+    <span className={`inline-block w-2 h-2 rounded-full ${color} mr-1.5 flex-shrink-0`} />
   );
 }
 
-function Toggle({
-  enabled,
-  loading,
-  onChange,
-}: {
-  enabled: boolean;
-  loading: boolean;
-  onChange: (v: boolean) => void;
-}) {
+function ScraperToggle({
+  enabled, loading, onChange,
+}: { enabled: boolean; loading: boolean; onChange: (v: boolean) => void }) {
   return (
     <button
       onClick={() => !loading && onChange(!enabled)}
@@ -112,15 +110,62 @@ function Toggle({
         ${loading ? "opacity-50 cursor-wait" : "cursor-pointer"}`}
       title={enabled ? "Scraper ON — click to disable" : "Scraper OFF — click to enable"}
     >
-      <span
-        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform duration-200
-          ${enabled ? "translate-x-4.5" : "translate-x-0.5"}`}
-      />
+      <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform duration-200
+        ${enabled ? "translate-x-4.5" : "translate-x-0.5"}`} />
     </button>
   );
 }
 
-// Group profiles by RDP host
+function CampaignToggleBtn({
+  campaign, profileId, rdpHost, onDone,
+}: {
+  campaign: Campaign;
+  profileId: string;
+  rdpHost: string;
+  onDone: () => void;
+}) {
+  const [pending, setPending] = useState(false);
+  const isActive = (campaign.status || "").toLowerCase().includes("active") ||
+    (campaign.status || "").toLowerCase().includes("delivering");
+
+  async function handleToggle() {
+    if (pending) return;
+    setPending(true);
+    try {
+      const action = isActive ? "PAUSE" : "ACTIVATE";
+      await fetch(`${HERMES}/api/v1/meta-ads/commands`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rdp_host: rdpHost,
+          profile_id: profileId,
+          campaign_name: campaign.name || "",
+          action,
+        }),
+      });
+      onDone();
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <button
+      onClick={handleToggle}
+      disabled={pending}
+      title={isActive ? "Pause campaign" : "Activate campaign"}
+      className={`text-xs px-2 py-0.5 rounded font-medium transition-colors flex-shrink-0
+        ${pending ? "opacity-50 cursor-wait" : "cursor-pointer"}
+        ${isActive
+          ? "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30"
+          : "bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30"
+        }`}
+    >
+      {pending ? "…" : isActive ? "Pause" : "Activate"}
+    </button>
+  );
+}
+
 function byRdp(profiles: Profile[]): Record<string, Profile[]> {
   const out: Record<string, Profile[]> = {};
   for (const p of profiles) {
@@ -131,21 +176,26 @@ function byRdp(profiles: Profile[]): Record<string, Profile[]> {
 
 export function MetaAdsPanel() {
   const [toggling, setToggling] = useState(false);
+  const [selectedDate, setSelectedDate] = useState<string>("");  // "" = live
+  const [campaignFilter, setCampaignFilter] = useState("");
+
+  const summaryUrl = selectedDate
+    ? `${HERMES}/api/v1/meta-ads/summary?date=${selectedDate}`
+    : `${HERMES}/api/v1/meta-ads/summary`;
 
   const {
     data: summary,
     error: summaryErr,
     mutate: mutateSummary,
-  } = useSWR<Summary>(`${HERMES}/api/v1/meta-ads/summary`, fetcher, {
-    refreshInterval: 30_000,
+  } = useSWR<Summary>(summaryUrl, fetcher, {
+    refreshInterval: selectedDate ? 0 : 30_000,
   });
 
-  const {
-    data: control,
-    mutate: mutateControl,
-  } = useSWR<Control>(`${HERMES}/api/v1/meta-ads/control`, fetcher, {
-    refreshInterval: 5_000,
-  });
+  const { data: control, mutate: mutateControl } = useSWR<Control>(
+    `${HERMES}/api/v1/meta-ads/control`,
+    fetcher,
+    { refreshInterval: 5_000 }
+  );
 
   const loading = !summary && !summaryErr;
   const stale = summary?.stale || summaryErr;
@@ -165,7 +215,6 @@ export function MetaAdsPanel() {
     }
   }
 
-  // Get last scrape time per RDP machine
   const rdpLastSeen: Record<string, string> = {};
   for (const p of summary?.profiles ?? []) {
     if (p.scraped_at) {
@@ -177,52 +226,68 @@ export function MetaAdsPanel() {
   const grouped = byRdp(summary?.profiles ?? []);
   const rdpHosts = Object.keys(grouped).sort();
 
+  // Filter campaigns client-side
+  const lcFilter = campaignFilter.toLowerCase();
+
   return (
     <div className="bg-jarvis-surface border border-jarvis-border rounded-xl p-4">
       {/* ── Header ── */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <span className="text-lg">📊</span>
           <h2 className="text-jarvis-text font-semibold text-sm">Meta Ads</h2>
-          {/* Scraper status badge */}
-          <span
-            className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-              scraperEnabled
-                ? "bg-emerald-500/15 text-emerald-400"
-                : "bg-amber-500/15 text-amber-400"
-            }`}
-          >
+          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+            scraperEnabled ? "bg-emerald-500/15 text-emerald-400" : "bg-amber-500/15 text-amber-400"
+          }`}>
             {scraperEnabled ? "● Scraping" : "● Paused"}
           </span>
         </div>
 
         <div className="flex items-center gap-3">
-          {/* Scraper on/off toggle */}
           <div className="flex items-center gap-1.5">
-            <span className="text-jarvis-muted text-xs">
-              {scraperEnabled ? "ON" : "OFF"}
-            </span>
-            <Toggle
-              enabled={scraperEnabled}
-              loading={toggling}
-              onChange={toggleScraper}
-            />
+            <span className="text-jarvis-muted text-xs">{scraperEnabled ? "ON" : "OFF"}</span>
+            <ScraperToggle enabled={scraperEnabled} loading={toggling} onChange={toggleScraper} />
           </div>
-
           <span className="text-jarvis-muted text-xs">
             {summary?.last_updated ? timeSince(summary.last_updated) : "—"}
           </span>
           <button
             onClick={() => { mutateSummary(); mutateControl(); }}
             className="text-jarvis-muted hover:text-jarvis-accent text-xs"
-          >
-            ↻
-          </button>
+          >↻</button>
         </div>
       </div>
 
+      {/* ── Date picker + Campaign filter ── */}
+      <div className="flex gap-2 mb-3">
+        <div className="flex items-center gap-1.5 flex-1">
+          <span className="text-jarvis-muted text-xs flex-shrink-0">📅</span>
+          <input
+            type="date"
+            value={selectedDate}
+            max={todayStr()}
+            onChange={(e) => setSelectedDate(e.target.value)}
+            className="flex-1 bg-jarvis-bg border border-jarvis-border rounded px-2 py-1 text-xs text-jarvis-text focus:outline-none focus:border-jarvis-accent"
+          />
+          {selectedDate && (
+            <button
+              onClick={() => setSelectedDate("")}
+              className="text-jarvis-muted hover:text-jarvis-accent text-xs flex-shrink-0"
+              title="Back to live view"
+            >✕</button>
+          )}
+        </div>
+        <input
+          type="text"
+          placeholder="Filter campaigns…"
+          value={campaignFilter}
+          onChange={(e) => setCampaignFilter(e.target.value)}
+          className="flex-1 bg-jarvis-bg border border-jarvis-border rounded px-2 py-1 text-xs text-jarvis-text placeholder-jarvis-muted focus:outline-none focus:border-jarvis-accent"
+        />
+      </div>
+
       {/* ── RDP Machine Status Row ── */}
-      {(rdpHosts.length > 0 || !loading) && (
+      {!loading && (
         <div className="flex gap-2 mb-4">
           {["RDP-1", "RDP-2"].map((rdp) => {
             const lastSeen = rdpLastSeen[rdp];
@@ -231,16 +296,11 @@ export function MetaAdsPanel() {
               : null;
             const online = minsAgo != null && minsAgo < 10;
             return (
-              <div
-                key={rdp}
-                className="flex-1 bg-jarvis-bg rounded-lg px-3 py-2 flex items-center justify-between"
-              >
+              <div key={rdp} className="flex-1 bg-jarvis-bg rounded-lg px-3 py-2 flex items-center justify-between">
                 <div className="flex items-center gap-1.5">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      online ? "bg-emerald-500" : lastSeen ? "bg-amber-400" : "bg-jarvis-muted/40"
-                    }`}
-                  />
+                  <span className={`w-2 h-2 rounded-full ${
+                    online ? "bg-emerald-500" : lastSeen ? "bg-amber-400" : "bg-jarvis-muted/40"
+                  }`} />
                   <span className="text-jarvis-text text-xs font-medium">{rdp}</span>
                 </div>
                 <span className="text-jarvis-muted text-xs">
@@ -252,16 +312,15 @@ export function MetaAdsPanel() {
         </div>
       )}
 
-      {loading && (
-        <div className="text-jarvis-muted text-sm animate-pulse">Loading ad data…</div>
-      )}
+      {loading && <div className="text-jarvis-muted text-sm animate-pulse">Loading ad data…</div>}
 
       {!loading && stale && (
         <div className="text-jarvis-muted text-sm">
-          No recent data.{" "}
-          {scraperEnabled
-            ? "Waiting for next scrape (every 5 min)."
-            : "Scraper is paused — enable it above to start collecting data."}
+          {selectedDate ? `No data for ${selectedDate}.` : (
+            scraperEnabled
+              ? "No recent data. Waiting for next scrape (every 5 min)."
+              : "Scraper is paused — enable it above."
+          )}
         </div>
       )}
 
@@ -276,13 +335,8 @@ export function MetaAdsPanel() {
               { label: "Avg CTR", value: `${fmt(summary.avg_ctr)}%` },
               { label: "Campaigns", value: String(summary.active_campaigns || summary.profiles_count) },
             ].map(({ label, value }) => (
-              <div
-                key={label}
-                className="bg-jarvis-bg rounded-lg p-2 text-center"
-              >
-                <div className="text-jarvis-accent font-mono font-bold text-sm">
-                  {value}
-                </div>
+              <div key={label} className="bg-jarvis-bg rounded-lg p-2 text-center">
+                <div className="text-jarvis-accent font-mono font-bold text-sm">{value}</div>
                 <div className="text-jarvis-muted text-xs mt-0.5">{label}</div>
               </div>
             ))}
@@ -292,26 +346,20 @@ export function MetaAdsPanel() {
           {rdpHosts.map((rdp) => (
             <div key={rdp} className="mb-3">
               <div className="flex items-center gap-2 mb-2">
-                <span className="text-jarvis-muted text-xs font-semibold uppercase tracking-wider">
-                  {rdp}
-                </span>
+                <span className="text-jarvis-muted text-xs font-semibold uppercase tracking-wider">{rdp}</span>
                 <div className="h-px flex-1 bg-jarvis-border" />
               </div>
 
               <div className="space-y-2">
                 {grouped[rdp].map((profile) => {
-                  const spend =
-                    profile.summary.total_spend_all ??
-                    profile.summary.total_spend;
-                  const campaignCount =
-                    profile.summary.total_campaigns ??
-                    profile.campaigns.length;
+                  const spend = profile.summary.total_spend_all ?? profile.summary.total_spend;
+                  const campaignCount = profile.summary.total_campaigns ?? profile.campaigns.length;
+                  const visibleCampaigns = profile.campaigns.filter((c) =>
+                    !lcFilter || (c.name || "").toLowerCase().includes(lcFilter)
+                  );
 
                   return (
-                    <div
-                      key={profile.profile_id}
-                      className="border border-jarvis-border rounded-lg p-3"
-                    >
+                    <div key={profile.profile_id} className="border border-jarvis-border rounded-lg p-3">
                       {/* Profile header */}
                       <div className="flex items-center justify-between mb-2">
                         <div className="flex items-center gap-1.5 min-w-0">
@@ -320,24 +368,16 @@ export function MetaAdsPanel() {
                           </span>
                           {profile.ad_account_id && (
                             <span className="text-jarvis-muted text-xs font-mono flex-shrink-0">
-                              ·{" "}
-                              {profile.ad_account_id.slice(-6)}
+                              · {profile.ad_account_id.slice(-6)}
                             </span>
                           )}
                         </div>
                         <div className="flex items-center gap-2 flex-shrink-0">
                           {profile.error && (
-                            <span
-                              className="text-red-400 text-xs"
-                              title={profile.error}
-                            >
-                              ⚠
-                            </span>
+                            <span className="text-red-400 text-xs" title={profile.error}>⚠</span>
                           )}
                           <span className="text-jarvis-muted text-xs">
-                            {profile.scraped_at
-                              ? timeSince(profile.scraped_at)
-                              : "—"}
+                            {profile.scraped_at ? timeSince(profile.scraped_at) : "—"}
                           </span>
                         </div>
                       </div>
@@ -348,72 +388,73 @@ export function MetaAdsPanel() {
                           <div className="text-jarvis-accent font-mono font-bold text-xl leading-none">
                             ${spend != null ? fmt(spend) : "—"}
                           </div>
-                          <div className="text-jarvis-muted text-xs mt-0.5">
-                            total spend
-                          </div>
+                          <div className="text-jarvis-muted text-xs mt-0.5">total spend</div>
                         </div>
                         <div>
                           <div className="text-jarvis-text font-mono font-semibold text-base leading-none">
                             {campaignCount ?? "—"}
                           </div>
-                          <div className="text-jarvis-muted text-xs mt-0.5">
-                            campaigns
-                          </div>
+                          <div className="text-jarvis-muted text-xs mt-0.5">campaigns</div>
                         </div>
                         {profile.summary.total_impressions != null && (
                           <div>
                             <div className="text-jarvis-text font-mono text-base leading-none">
                               {fmt(profile.summary.total_impressions, 0)}
                             </div>
-                            <div className="text-jarvis-muted text-xs mt-0.5">
-                              impressions
-                            </div>
+                            <div className="text-jarvis-muted text-xs mt-0.5">impressions</div>
                           </div>
                         )}
                       </div>
 
-                      {/* Campaign rows */}
-                      {profile.campaigns.length > 0 && (
+                      {/* Campaign rows with toggle buttons */}
+                      {visibleCampaigns.length > 0 && (
                         <div className="space-y-1 border-t border-jarvis-border/50 pt-2 mt-2">
-                          {profile.campaigns.slice(0, 6).map((c, i) => (
-                            <div
-                              key={i}
-                              className="flex items-center justify-between text-xs"
-                            >
-                              <div className="flex items-center min-w-0">
+                          {visibleCampaigns.slice(0, 10).map((c, i) => (
+                            <div key={i} className="flex items-center justify-between text-xs gap-2">
+                              <div className="flex items-center min-w-0 flex-1">
                                 <StatusDot status={c.status} />
-                                <span className="text-jarvis-text truncate max-w-[180px]">
+                                <span className="text-jarvis-text truncate max-w-[160px]">
                                   {c.name || `Campaign ${i + 1}`}
                                 </span>
-                                {c.status?.toLowerCase().includes("draft") && (
-                                  <span className="ml-1 text-blue-400 text-xs">(draft)</span>
-                                )}
                               </div>
-                              <div className="flex items-center gap-3 ml-2 flex-shrink-0 text-jarvis-muted font-mono">
+                              <div className="flex items-center gap-2 flex-shrink-0">
                                 {c.spend && (
-                                  <span className="text-jarvis-accent">
-                                    {c.spend}
-                                  </span>
+                                  <span className="text-jarvis-accent font-mono">{c.spend}</span>
+                                )}
+                                {c.budget && (
+                                  <span className="text-jarvis-muted font-mono">/{c.budget}</span>
                                 )}
                                 {c.impressions && (
-                                  <span>{c.impressions} impr</span>
+                                  <span className="text-jarvis-muted font-mono hidden sm:inline">
+                                    {c.impressions} impr
+                                  </span>
                                 )}
-                                {c.ctr && <span>{c.ctr} CTR</span>}
+                                <CampaignToggleBtn
+                                  campaign={c}
+                                  profileId={profile.profile_id}
+                                  rdpHost={profile.rdp_host}
+                                  onDone={mutateSummary}
+                                />
                               </div>
                             </div>
                           ))}
-                          {profile.campaigns.length > 6 && (
+                          {visibleCampaigns.length > 10 && (
                             <div className="text-jarvis-muted text-xs pt-0.5">
-                              +{profile.campaigns.length - 6} more
+                              +{visibleCampaigns.length - 10} more
+                              {lcFilter && ` matching "${campaignFilter}"`}
                             </div>
                           )}
                         </div>
                       )}
 
-                      {profile.campaigns.length === 0 && !profile.error && (
-                        <div className="text-jarvis-muted text-xs">
-                          No campaigns captured
+                      {visibleCampaigns.length === 0 && profile.campaigns.length > 0 && lcFilter && (
+                        <div className="text-jarvis-muted text-xs border-t border-jarvis-border/50 pt-2 mt-2">
+                          No campaigns matching &ldquo;{campaignFilter}&rdquo;
                         </div>
+                      )}
+
+                      {profile.campaigns.length === 0 && !profile.error && (
+                        <div className="text-jarvis-muted text-xs">No campaigns captured</div>
                       )}
                     </div>
                   );
@@ -423,6 +464,11 @@ export function MetaAdsPanel() {
           ))}
         </>
       )}
+
+      {/* ── Command pending note ── */}
+      <div className="mt-2 text-jarvis-muted text-xs text-center">
+        Campaign toggles execute on next scraper run (~5 min) · JARVIS notifies on completion
+      </div>
     </div>
   );
 }

@@ -150,42 +150,52 @@ async def _handle_rdp(chat_id: int) -> None:
     await _send(chat_id, "\n".join(lines))
 
 
-async def _handle_ads(chat_id: int) -> None:
-    """Return live Meta Ads summary across all RDP profiles."""
-    await _send(chat_id, "⏳ Fetching Meta Ads data...")
+async def _handle_ads(chat_id: int, date_arg: str | None = None) -> None:
+    """Return Meta Ads summary — live (last 2h) or for a specific date."""
+    label = f"for {date_arg}" if date_arg else "live"
+    await _send(chat_id, f"⏳ Fetching Meta Ads data ({label})...")
     try:
+        url = "http://localhost:8000/api/v1/meta-ads/summary"
+        params = {"date": date_arg} if date_arg else {}
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get("http://localhost:8000/api/v1/meta-ads/summary")
+            resp = await client.get(url, params=params)
             data = resp.json()
     except Exception as e:
         await _send(chat_id, f"❌ Failed to fetch ads data: {e}")
         return
 
     if data.get("stale") or data.get("profiles_count", 0) == 0:
-        await _send(chat_id, (
-            "⚠️ <b>No Meta Ads data yet</b>\n\n"
-            "Run the scraper on your RDP machines to start ingesting data."
-        ))
+        msg = f"⚠️ <b>No Meta Ads data</b> for {date_arg or 'last 2 hours'}."
+        await _send(chat_id, msg)
         return
 
+    title = f"📊 <b>Meta Ads — {date_arg or 'Live'}</b>"
     lines = [
-        "📊 <b>Meta Ads — Live Summary</b>\n",
-        f"💰 Total Spend: <b>${data['total_spend']:,.2f}</b>",
-        f"👁 Impressions: <b>{data['total_impressions']:,}</b>",
-        f"🖱 Clicks: <b>{data['total_clicks']:,}</b>",
-        f"📈 Avg CTR: <b>{data['avg_ctr']:.2f}%</b>",
-        f"▶️ Active Campaigns: <b>{data['active_campaigns']}</b>",
+        title,
         "",
-        "<b>Per Account:</b>",
+        f"💰 Total Spend: <b>${data['total_spend']:,.2f}</b>",
+        f"▶️ Active Campaigns: <b>{data['active_campaigns']}</b>",
+        f"👁 Impressions: <b>{data['total_impressions']:,}</b>",
+        f"📈 Avg CTR: <b>{data['avg_ctr']:.2f}%</b>",
+        "",
+        "<b>Campaigns:</b>",
     ]
+
     for p in data.get("profiles", []):
         s = p.get("summary", {})
-        name = p.get("ad_account_name") or p.get("profile_name") or p.get("profile_id")
+        acc = p.get("ad_account_name") or p.get("profile_name") or p.get("profile_id")
         spend = s.get("total_spend", 0) or 0
-        impressions = s.get("total_impressions", 0) or 0
-        active = s.get("active_campaigns", 0) or 0
         err = " ⚠️" if p.get("error") else ""
-        lines.append(f"• <b>{name}</b>{err} [{p['rdp_host']}]\n  ${spend:,.2f} · {impressions:,} impr · {active} active")
+        lines.append(f"\n<b>{acc}</b>{err} [{p['rdp_host']}] ${spend:,.2f}")
+        for c in p.get("campaigns", [])[:8]:
+            name = c.get("name", "?")
+            c_spend = c.get("spend", "")
+            status = c.get("status", "")
+            icon = "🟢" if "active" in status.lower() or "delivering" in status.lower() else "⚪"
+            line = f"  {icon} {name}"
+            if c_spend:
+                line += f" · {c_spend}"
+            lines.append(line)
 
     updated = data.get("last_updated", "")
     if updated:
@@ -199,6 +209,79 @@ async def _handle_ads(chat_id: int) -> None:
             pass
 
     await _send(chat_id, "\n".join(lines))
+
+
+async def _handle_campaign_toggle(chat_id: int, action: str, campaign_name: str) -> None:
+    """Queue a campaign ACTIVATE or PAUSE command."""
+    if not campaign_name:
+        cmd_word = "pause" if action == "PAUSE" else "activate"
+        await _send(chat_id, f"Usage: /{cmd_word} &lt;campaign name&gt;")
+        return
+
+    await _send(chat_id, f"🔍 Searching for campaign <b>{campaign_name}</b>...")
+
+    # Find campaign in recent snapshots (last 24h)
+    from src.db.connection import AsyncSessionLocal
+    from src.db.models import MetaAdsSnapshot
+    from sqlalchemy import select, desc
+    from datetime import datetime, timezone as tz, timedelta
+
+    cutoff = datetime.now(tz.utc) - timedelta(hours=24)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(MetaAdsSnapshot)
+            .where(MetaAdsSnapshot.scraped_at >= cutoff)
+            .order_by(desc(MetaAdsSnapshot.scraped_at))
+        )
+        snapshots = result.scalars().all()
+
+    # Find all profiles containing this campaign (case-insensitive)
+    matches: list[dict] = []
+    seen_profiles: set[str] = set()
+    for snap in snapshots:
+        key = f"{snap.rdp_host}:{snap.profile_id}"
+        if key in seen_profiles:
+            continue
+        for c in snap.campaigns:
+            if campaign_name.lower() in (c.get("name") or "").lower():
+                matches.append({
+                    "rdp_host": snap.rdp_host,
+                    "profile_id": snap.profile_id,
+                    "profile_name": snap.profile_name or snap.profile_id,
+                    "campaign_name": c.get("name", campaign_name),
+                })
+                seen_profiles.add(key)
+                break
+
+    if not matches:
+        await _send(chat_id, f"❌ No campaign found matching <b>{campaign_name}</b> in last 24h data.")
+        return
+
+    # Queue commands for all matching profiles
+    action_word = "activate" if action == "ACTIVATE" else "pause"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for m in matches:
+                await client.post(
+                    "http://localhost:8000/api/v1/meta-ads/commands",
+                    json={
+                        "rdp_host": m["rdp_host"],
+                        "profile_id": m["profile_id"],
+                        "campaign_name": m["campaign_name"],
+                        "action": action,
+                    },
+                )
+    except Exception as e:
+        await _send(chat_id, f"❌ Failed to queue command: {e}")
+        return
+
+    profiles_str = ", ".join(f"{m['profile_name']} ({m['rdp_host']})" for m in matches)
+    await _send(
+        chat_id,
+        f"⏳ Queued: <b>{action_word}</b> '<b>{matches[0]['campaign_name']}</b>'\n"
+        f"Profiles: {profiles_str}\n\n"
+        f"<i>Will execute on next scraper run (~5 min). You'll get a confirmation when done.</i>"
+    )
 
 
 async def _handle_workflows(chat_id: int) -> None:
@@ -290,24 +373,60 @@ async def _handle_run(chat_id: int, arg: str) -> None:
         await _send(chat_id, f"❌ Error: {e}")
 
 
+async def _handle_calls(chat_id: int) -> None:
+    """Return last 6 VAPI call events from memory."""
+    from src.db.connection import AsyncSessionLocal
+    from src.db.models import Memory
+    from sqlalchemy import select, or_
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Memory)
+            .where(or_(
+                Memory.source == "vapi_webhook",
+                Memory.type.in_(["call_transcript", "call_transfer", "call_status", "vapi_event"]),
+            ))
+            .order_by(Memory.created_at.desc())
+            .limit(6)
+        )
+        calls = result.scalars().all()
+
+    if not calls:
+        await _send(chat_id, "📵 No VAPI call records yet.")
+        return
+
+    lines = ["<b>📞 Recent VAPI Calls</b>\n"]
+    for c in calls:
+        ts = c.created_at.strftime("%m/%d %H:%M") if c.created_at else "?"
+        type_icon = {
+            "call_transcript": "📞",
+            "call_transfer": "🔀",
+            "call_status": "📲",
+            "vapi_event": "🔧",
+            "vapi_tool_call": "🛠",
+        }.get(c.type, "📋")
+        preview = c.content[:150].replace("\n", " ")
+        lines.append(f"{type_icon} <b>{c.type}</b> [{ts}]\n{preview}\n")
+
+    await _send(chat_id, "\n".join(lines))
+
+
 async def _handle_ai(chat_id: int, text: str) -> None:
-    """Pass free-text to Claude Haiku and reply."""
-    from anthropic import AsyncAnthropic
+    """Pass free-text to JARVIS AI (Groq via ai_client, Anthropic fallback)."""
+    from src.core.ai_client import ai_client
     await _send(chat_id, "🤔 Thinking...")
     try:
-        client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
+        reply = await ai_client.chat(
+            messages=[{"role": "user", "content": text}],
+            model="fast",
             system=(
                 "You are JARVIS, the AI chief of staff for Thomas Shelby. "
                 "Be concise, direct, and useful. No filler. Plain text only (no markdown)."
             ),
-            messages=[{"role": "user", "content": text}],
+            max_tokens=500,
         )
-        reply = response.content[0].text
     except Exception as e:
-        reply = f"Error calling Claude: {e}"
+        reply = f"Error: {e}"
     await _send(chat_id, reply, parse_mode="")
 
 
@@ -318,12 +437,16 @@ HELP_TEXT = """<b>🤖 JARVIS Commands</b>
 /memory — last 5 memory entries
 /workflows — recent n8n automation activity
 /intel — AI pattern insights
+/calls — last 6 VAPI call records
 /run &lt;job&gt; — trigger a job (briefing, health, report, pattern, planning, memory)
 /rdp — RDP machine statuses
 /ads — Meta Ads live summary
+/ads 2026-07-01 — Meta Ads for a specific date
+/pause &lt;campaign name&gt; — pause a campaign via CDP
+/activate &lt;campaign name&gt; — activate a campaign via CDP
 /help — this message
 
-Or just type anything to ask Claude Haiku."""
+Or just type anything to ask JARVIS (Groq/Anthropic AI)."""
 
 
 async def process_updates() -> None:
@@ -377,7 +500,17 @@ async def process_updates() -> None:
         elif cmd == "/rdp":
             await _handle_rdp(chat_id)
         elif cmd == "/ads":
-            await _handle_ads(chat_id)
+            parts = text.split()
+            date_arg = parts[1] if len(parts) > 1 else None
+            await _handle_ads(chat_id, date_arg)
+        elif cmd in ("/pause", "/deactivate"):
+            campaign_arg = " ".join(text.split()[1:])
+            await _handle_campaign_toggle(chat_id, "PAUSE", campaign_arg)
+        elif cmd == "/activate":
+            campaign_arg = " ".join(text.split()[1:])
+            await _handle_campaign_toggle(chat_id, "ACTIVATE", campaign_arg)
+        elif cmd == "/calls":
+            await _handle_calls(chat_id)
         elif cmd in ("/help", "/start"):
             await _send(chat_id, HELP_TEXT)
         else:

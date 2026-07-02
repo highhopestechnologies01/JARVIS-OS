@@ -88,6 +88,21 @@ class MetaAdsSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class CampaignCommand(Base):
+    """Queue of campaign on/off commands to be executed by the scraper via CDP."""
+    __tablename__ = "campaign_commands"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    rdp_host: Mapped[str] = mapped_column(String(50), nullable=False)           # "RDP-1" | "RDP-2"
+    profile_id: Mapped[str] = mapped_column(String(100), nullable=False)         # AdsPower user_id
+    campaign_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    action: Mapped[str] = mapped_column(String(20), nullable=False)              # "ACTIVATE" | "PAUSE"
+    status: Mapped[str] = mapped_column(String(20), default="pending")           # "pending" | "done" | "failed"
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Notification(Base):
     __tablename__ = "notifications"
 

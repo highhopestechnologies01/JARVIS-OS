@@ -1,23 +1,24 @@
 """
-Meta Ads — ingest endpoint (receives data from RDP scraper)
-and query endpoints (serves dashboard + Telegram).
+Meta Ads — ingest endpoint (receives data from RDP scraper),
+query endpoints (serves dashboard + Telegram), and campaign
+command queue (toggle campaigns on/off via CDP).
 
-Auth: X-Scraper-Token header on POST /ingest.
+Auth: X-Scraper-Token header on POST /ingest and command endpoints.
 """
 
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date as date_type
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.connection import get_db
-from src.db.models import MetaAdsSnapshot, Memory
+from src.db.models import MetaAdsSnapshot, Memory, CampaignCommand
 
 log = structlog.get_logger()
 router = APIRouter(prefix="/api/v1/meta-ads", tags=["meta-ads"])
@@ -66,6 +67,19 @@ def _require_scraper_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid scraper token")
 
 
+def _date_window(date_str: str | None) -> tuple[datetime, datetime]:
+    """Return (start, end) UTC datetimes for querying."""
+    if date_str:
+        try:
+            d = date_type.fromisoformat(date_str)
+            start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
+            return start, start + timedelta(days=1)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date — use YYYY-MM-DD")
+    now = datetime.now(timezone.utc)
+    return now - timedelta(hours=2), now
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/ingest")
@@ -99,15 +113,18 @@ async def ingest(
 
 
 @router.get("/summary")
-async def summary(db: AsyncSession = Depends(get_db)):
+async def summary(
+    date: str | None = Query(None, description="YYYY-MM-DD — omit for live (last 2h)"),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Return latest snapshot per profile (last 2 hours) with aggregated totals.
-    Used by dashboard panel and Telegram /ads command.
+    Return latest snapshot per profile within the window with aggregated totals.
+    date param: specific date (full day); omit for live last-2h view.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+    start, end = _date_window(date)
     result = await db.execute(
         select(MetaAdsSnapshot)
-        .where(MetaAdsSnapshot.scraped_at >= cutoff)
+        .where(MetaAdsSnapshot.scraped_at >= start, MetaAdsSnapshot.scraped_at < end)
         .order_by(desc(MetaAdsSnapshot.scraped_at))
     )
     rows = result.scalars().all()
@@ -125,7 +142,6 @@ async def summary(db: AsyncSession = Depends(get_db)):
     total_clicks = sum(r.summary.get("total_clicks", 0) for r in latest)
     active_campaigns = sum(r.summary.get("active_campaigns", 0) for r in latest)
     avg_ctr = round(total_clicks / total_impr * 100, 2) if total_impr > 0 else 0
-
     last_updated = max((r.scraped_at for r in latest), default=None) if latest else None
 
     profiles_out = []
@@ -152,6 +168,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
         "last_updated": last_updated.isoformat() if last_updated else None,
         "profiles": profiles_out,
         "stale": len(latest) == 0,
+        "date": date,
     }
 
 
@@ -199,12 +216,16 @@ async def set_control(
 @router.get("/campaigns")
 async def campaigns(
     rdp_host: str | None = None,
+    date: str | None = Query(None, description="YYYY-MM-DD filter"),
+    campaign: str | None = Query(None, description="Campaign name substring filter"),
     db: AsyncSession = Depends(get_db),
 ):
-    """All campaigns from latest snapshots, optionally filtered by RDP host."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
-    q = select(MetaAdsSnapshot).where(MetaAdsSnapshot.scraped_at >= cutoff).order_by(
-        desc(MetaAdsSnapshot.scraped_at)
+    """All campaigns from latest snapshots — filterable by date, RDP host, and name."""
+    start, end = _date_window(date)
+    q = (
+        select(MetaAdsSnapshot)
+        .where(MetaAdsSnapshot.scraped_at >= start, MetaAdsSnapshot.scraped_at < end)
+        .order_by(desc(MetaAdsSnapshot.scraped_at))
     )
     result = await db.execute(q)
     rows = result.scalars().all()
@@ -220,11 +241,116 @@ async def campaigns(
         if rdp_host and r.rdp_host != rdp_host:
             continue
         for c in r.campaigns:
+            c_name = c.get("name", "")
+            if campaign and campaign.lower() not in c_name.lower():
+                continue
             all_campaigns.append({
                 **c,
+                "profile_id": r.profile_id,
                 "profile_name": r.profile_name,
                 "ad_account_name": r.ad_account_name,
                 "rdp_host": r.rdp_host,
             })
 
     return {"campaigns": all_campaigns, "total": len(all_campaigns)}
+
+
+# ── Campaign Command Queue ────────────────────────────────────────────────────
+
+class CommandPayload(BaseModel):
+    rdp_host: str
+    profile_id: str
+    campaign_name: str
+    action: str     # "ACTIVATE" | "PAUSE"
+
+
+class CommandResultPayload(BaseModel):
+    status: str     # "done" | "failed"
+    error: str | None = None
+
+
+@router.post("/commands")
+async def queue_command(
+    payload: CommandPayload,
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue a campaign on/off command. Dashboard or Telegram calls this."""
+    if payload.action not in ("ACTIVATE", "PAUSE"):
+        raise HTTPException(status_code=400, detail="action must be ACTIVATE or PAUSE")
+
+    cmd = CampaignCommand(
+        rdp_host=payload.rdp_host,
+        profile_id=payload.profile_id,
+        campaign_name=payload.campaign_name,
+        action=payload.action,
+    )
+    db.add(cmd)
+    await db.commit()
+    await db.refresh(cmd)
+    log.info("meta_ads.command.queued", campaign=payload.campaign_name, action=payload.action)
+    return {"id": str(cmd.id), "status": "pending"}
+
+
+@router.get("/commands/pending")
+async def get_pending_commands(
+    request: Request,
+    rdp_host: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return pending commands for a given RDP host. Called by the scraper."""
+    _require_scraper_token(request)
+    q = select(CampaignCommand).where(CampaignCommand.status == "pending")
+    if rdp_host:
+        q = q.where(CampaignCommand.rdp_host == rdp_host)
+    result = await db.execute(q.order_by(CampaignCommand.created_at))
+    cmds = result.scalars().all()
+    return {
+        "commands": [
+            {
+                "id": str(c.id),
+                "profile_id": c.profile_id,
+                "campaign_name": c.campaign_name,
+                "action": c.action,
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in cmds
+        ]
+    }
+
+
+@router.patch("/commands/{cmd_id}/result")
+async def report_command_result(
+    cmd_id: str,
+    payload: CommandResultPayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Scraper reports back whether the command succeeded or failed."""
+    _require_scraper_token(request)
+
+    result = await db.execute(
+        select(CampaignCommand).where(CampaignCommand.id == cmd_id)
+    )
+    cmd = result.scalar_one_or_none()
+    if not cmd:
+        raise HTTPException(status_code=404, detail="Command not found")
+
+    cmd.status = payload.status
+    cmd.error = payload.error
+    cmd.executed_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    # Notify Thomas via Telegram
+    try:
+        from src.core.notifications import dispatcher
+        action_word = "activated ✅" if cmd.action == "ACTIVATE" else "paused ⏸"
+        if payload.status == "done":
+            msg = f"📊 Campaign <b>{cmd.campaign_name}</b> {action_word} on {cmd.rdp_host}"
+        else:
+            msg = f"❌ Failed to toggle <b>{cmd.campaign_name}</b> on {cmd.rdp_host}: {payload.error or 'unknown'}"
+        await dispatcher.send_telegram(msg)
+    except Exception as e:
+        log.warning("meta_ads.command.notify_failed", error=str(e))
+
+    log.info("meta_ads.command.result", id=cmd_id, status=payload.status)
+    return {"id": cmd_id, "status": payload.status}
