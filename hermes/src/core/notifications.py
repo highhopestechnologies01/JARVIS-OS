@@ -28,6 +28,7 @@ class NotificationDispatcher:
         message: str,
         chat_id: str | None = None,
         parse_mode: str = "HTML",
+        reply_markup: dict | None = None,
     ) -> bool:
         """Send message via Telegram Bot API."""
         if not settings.telegram_bot_token:
@@ -40,13 +41,16 @@ class NotificationDispatcher:
             return False
 
         url = TELEGRAM_API.format(token=settings.telegram_bot_token)
+        payload: dict = {
+            "chat_id": cid,
+            "text": message,
+            "parse_mode": parse_mode,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(url, json={
-                    "chat_id": cid,
-                    "text": message,
-                    "parse_mode": parse_mode,
-                })
+                resp = await client.post(url, json=payload)
                 resp.raise_for_status()
             log.info("notifications.telegram.sent", chat_id=cid)
             return True

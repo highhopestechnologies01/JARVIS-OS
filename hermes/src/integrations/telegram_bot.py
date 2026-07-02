@@ -585,6 +585,18 @@ async def _handle_callback(chat_id: int, callback_id: str, data: str) -> None:
         date_part = data[4:]
         date_arg = None if date_part == "live" else date_part
         await _handle_ads(chat_id, date_arg)
+    elif data.startswith("pause:"):
+        # pause:RDP-1:profile_id:campaign_name
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            import urllib.parse
+            _, rdp_host, profile_id, campaign_enc = parts
+            campaign_name = urllib.parse.unquote(campaign_enc)
+            await _handle_campaign_toggle(chat_id, "PAUSE", campaign_name)
+        else:
+            await _send(chat_id, "❌ Invalid pause command")
+    elif data == "alert:dismiss":
+        await _send(chat_id, "✅ Alert dismissed.")
     else:
         await _send(chat_id, f"❓ Unknown action: {data}")
 

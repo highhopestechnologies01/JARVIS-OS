@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import useSWR from "swr";
 
 const HERMES = "";
@@ -163,6 +163,289 @@ function CampaignToggleBtn({
     >
       {pending ? "…" : isActive ? "Pause" : "Activate"}
     </button>
+  );
+}
+
+interface BudgetConfig {
+  enabled: boolean;
+  total_daily_cap: number;
+  alert_pct: number;
+  auto_pause_pct: number;
+  stopped_detection: boolean;
+  campaign_budgets: Record<string, number>;
+}
+
+const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
+  enabled: true,
+  total_daily_cap: 0,
+  alert_pct: 80,
+  auto_pause_pct: 100,
+  stopped_detection: true,
+  campaign_budgets: {},
+};
+
+function BudgetConfigPanel({ hermes }: { hermes: string }) {
+  const [open, setOpen] = useState(false);
+  const [cfg, setCfg] = useState<BudgetConfig>(DEFAULT_BUDGET_CONFIG);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [newCampaign, setNewCampaign] = useState("");
+  const [newBudget, setNewBudget] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const r = await fetch(`${hermes}/api/v1/meta-ads/budget-config`);
+      if (r.ok) setCfg(await r.json());
+    } catch { /* ignore */ }
+  }, [hermes]);
+
+  useEffect(() => { if (open) load(); }, [open, load]);
+
+  async function save() {
+    setSaving(true);
+    setSaved(false);
+    try {
+      await fetch(`${hermes}/api/v1/meta-ads/budget-config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cfg),
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function addCampaignBudget() {
+    const name = newCampaign.trim();
+    const budget = parseFloat(newBudget);
+    if (!name || isNaN(budget) || budget <= 0) return;
+    setCfg((c) => ({ ...c, campaign_budgets: { ...c.campaign_budgets, [name]: budget } }));
+    setNewCampaign("");
+    setNewBudget("");
+  }
+
+  function removeCampaignBudget(name: string) {
+    setCfg((c) => {
+      const b = { ...c.campaign_budgets };
+      delete b[name];
+      return { ...c, campaign_budgets: b };
+    });
+  }
+
+  return (
+    <div className="border border-jarvis-border rounded-lg mt-3">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center justify-between px-3 py-2 text-xs text-jarvis-muted hover:text-jarvis-text transition-colors"
+      >
+        <span className="flex items-center gap-1.5">⚙️ <span className="font-medium">Budget & Alert Config</span></span>
+        <span>{open ? "▲" : "▼"}</span>
+      </button>
+
+      {open && (
+        <div className="px-3 pb-3 space-y-3 border-t border-jarvis-border/50 pt-3">
+          {/* Master enable */}
+          <div className="flex items-center justify-between">
+            <span className="text-jarvis-text text-xs font-medium">Spend Alerts Enabled</span>
+            <button
+              onClick={() => setCfg((c) => ({ ...c, enabled: !c.enabled }))}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors
+                ${cfg.enabled ? "bg-emerald-500" : "bg-jarvis-muted/40"}`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform
+                ${cfg.enabled ? "translate-x-4.5" : "translate-x-0.5"}`} />
+            </button>
+          </div>
+
+          {/* Numeric thresholds */}
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { label: "Alert at %", key: "alert_pct" as const, hint: "Send alert when spend hits this % of budget" },
+              { label: "Auto-pause at %", key: "auto_pause_pct" as const, hint: "Queue PAUSE when spend hits this %" },
+              { label: "Daily Cap $", key: "total_daily_cap" as const, hint: "Alert when total daily spend across all profiles hits this (0 = off)" },
+            ].map(({ label, key, hint }) => (
+              <div key={key}>
+                <label className="text-jarvis-muted text-xs block mb-1" title={hint}>{label}</label>
+                <input
+                  type="number"
+                  min={0}
+                  step={key === "total_daily_cap" ? 10 : 5}
+                  value={cfg[key]}
+                  onChange={(e) => setCfg((c) => ({ ...c, [key]: parseFloat(e.target.value) || 0 }))}
+                  className="w-full bg-jarvis-bg border border-jarvis-border rounded px-2 py-1 text-xs text-jarvis-text focus:outline-none focus:border-jarvis-accent"
+                />
+              </div>
+            ))}
+          </div>
+
+          {/* Stopped detection */}
+          <div className="flex items-center justify-between">
+            <span className="text-jarvis-muted text-xs" title="Alert when a campaign was spending last cycle but is now $0">
+              Detect campaigns that suddenly stop spending
+            </span>
+            <button
+              onClick={() => setCfg((c) => ({ ...c, stopped_detection: !c.stopped_detection }))}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors flex-shrink-0
+                ${cfg.stopped_detection ? "bg-emerald-500" : "bg-jarvis-muted/40"}`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform
+                ${cfg.stopped_detection ? "translate-x-4.5" : "translate-x-0.5"}`} />
+            </button>
+          </div>
+
+          {/* Per-campaign budgets */}
+          <div>
+            <div className="text-jarvis-muted text-xs font-medium mb-1.5">Per-Campaign Daily Budgets</div>
+            <div className="space-y-1 mb-2">
+              {Object.entries(cfg.campaign_budgets).map(([name, budget]) => (
+                <div key={name} className="flex items-center gap-2 text-xs">
+                  <span className="text-jarvis-text flex-1 truncate">{name}</span>
+                  <span className="text-jarvis-accent font-mono flex-shrink-0">${budget}</span>
+                  <button
+                    onClick={() => removeCampaignBudget(name)}
+                    className="text-red-400/70 hover:text-red-400 flex-shrink-0"
+                  >✕</button>
+                </div>
+              ))}
+              {Object.keys(cfg.campaign_budgets).length === 0 && (
+                <div className="text-jarvis-muted text-xs italic">No per-campaign budgets set — alerts won&apos;t fire unless you add budgets here</div>
+              )}
+            </div>
+            <div className="flex gap-1.5">
+              <input
+                type="text"
+                placeholder="Campaign name (exact)"
+                value={newCampaign}
+                onChange={(e) => setNewCampaign(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addCampaignBudget()}
+                className="flex-1 bg-jarvis-bg border border-jarvis-border rounded px-2 py-1 text-xs text-jarvis-text placeholder-jarvis-muted focus:outline-none focus:border-jarvis-accent"
+              />
+              <input
+                type="number"
+                placeholder="$ /day"
+                value={newBudget}
+                onChange={(e) => setNewBudget(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addCampaignBudget()}
+                className="w-20 bg-jarvis-bg border border-jarvis-border rounded px-2 py-1 text-xs text-jarvis-text placeholder-jarvis-muted focus:outline-none focus:border-jarvis-accent"
+              />
+              <button
+                onClick={addCampaignBudget}
+                className="text-jarvis-accent text-xs px-2 py-1 border border-jarvis-accent/40 rounded hover:bg-jarvis-accent/10 flex-shrink-0"
+              >+ Add</button>
+            </div>
+          </div>
+
+          {/* Save button */}
+          <button
+            onClick={save}
+            disabled={saving}
+            className={`w-full py-1.5 rounded text-xs font-medium transition-colors
+              ${saved
+                ? "bg-emerald-500/20 text-emerald-400"
+                : saving
+                ? "bg-jarvis-muted/20 text-jarvis-muted cursor-wait"
+                : "bg-jarvis-accent/20 text-jarvis-accent hover:bg-jarvis-accent/30"
+              }`}
+          >
+            {saved ? "✓ Saved" : saving ? "Saving…" : "Save Alert Config"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface InsightData {
+  summary?: string;
+  insights?: string[];
+  top_campaign?: string | null;
+  concern?: string | null;
+}
+
+interface InsightsResponse {
+  available: boolean;
+  data: InsightData | null;
+  updated_at: string | null;
+}
+
+function CampaignInsightsPanel({ hermes }: { hermes: string }) {
+  const [running, setRunning] = useState(false);
+  const { data, mutate } = useSWR<InsightsResponse>(
+    `${hermes}/api/v1/meta-ads/insights`,
+    fetcher,
+    { refreshInterval: 60_000 }
+  );
+
+  async function runNow() {
+    if (running) return;
+    setRunning(true);
+    try {
+      await fetch(`${hermes}/api/v1/meta-ads/insights/run`, { method: "POST" });
+      // Poll for result
+      await new Promise((r) => setTimeout(r, 8000));
+      await mutate();
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="border border-jarvis-border rounded-lg mt-3">
+      <div className="flex items-center justify-between px-3 py-2">
+        <span className="text-xs text-jarvis-text flex items-center gap-1.5">
+          🤖 <span className="font-medium">Campaign Insights</span>
+          {data?.updated_at && (
+            <span className="text-jarvis-muted ml-1">{timeSince(data.updated_at)}</span>
+          )}
+        </span>
+        <button
+          onClick={runNow}
+          disabled={running}
+          className={`text-xs px-2 py-0.5 rounded border transition-colors flex-shrink-0
+            ${running
+              ? "border-jarvis-muted/30 text-jarvis-muted cursor-wait"
+              : "border-jarvis-accent/40 text-jarvis-accent hover:bg-jarvis-accent/10"
+            }`}
+        >
+          {running ? "Analyzing…" : "▶ Run Now"}
+        </button>
+      </div>
+
+      {data?.available && data.data && (
+        <div className="px-3 pb-3 border-t border-jarvis-border/50 pt-2 space-y-2">
+          {data.data.summary && (
+            <p className="text-jarvis-muted text-xs italic">{data.data.summary}</p>
+          )}
+          {(data.data.insights || []).map((insight, i) => (
+            <div key={i} className="flex gap-2 text-xs">
+              <span className="text-jarvis-accent flex-shrink-0">{i + 1}.</span>
+              <span className="text-jarvis-text">{insight}</span>
+            </div>
+          ))}
+          {data.data.top_campaign && (
+            <div className="flex items-center gap-1.5 text-xs mt-1">
+              <span>🏆</span>
+              <span className="text-jarvis-muted">Top:</span>
+              <span className="text-emerald-400 font-medium">{data.data.top_campaign}</span>
+            </div>
+          )}
+          {data.data.concern && (
+            <div className="flex items-center gap-1.5 text-xs">
+              <span>⚠️</span>
+              <span className="text-amber-400">{data.data.concern}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {!data?.available && (
+        <div className="px-3 pb-3 text-jarvis-muted text-xs border-t border-jarvis-border/50 pt-2">
+          No insights yet — click ▶ Run Now or wait for the 9:30am daily job.
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -469,6 +752,12 @@ export function MetaAdsPanel() {
       <div className="mt-2 text-jarvis-muted text-xs text-center">
         Campaign toggles execute on next scraper run (~5 min) · JARVIS notifies on completion
       </div>
+
+      {/* ── Campaign Insights ── */}
+      <CampaignInsightsPanel hermes={HERMES} />
+
+      {/* ── Budget & Alert Config ── */}
+      <BudgetConfigPanel hermes={HERMES} />
     </div>
   );
 }

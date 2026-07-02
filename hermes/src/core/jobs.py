@@ -208,6 +208,21 @@ async def pattern_analysis():
     log.info("jobs.pattern_analysis.complete", insights=len(insights))
 
 
+async def campaign_insights():
+    """
+    Run every day at 9am ET (after briefing).
+    Analyzes last 24h of Meta Ads data with Claude Haiku,
+    stores insights in Memory, and sends Telegram summary.
+    """
+    from src.db.connection import AsyncSessionLocal
+    from src.core.campaign_insights import insights_engine
+
+    log.info("jobs.campaign_insights.start")
+    async with AsyncSessionLocal() as db:
+        result = await insights_engine.run(db)
+    log.info("jobs.campaign_insights.complete", insights=len(result.get("insights", [])))
+
+
 async def autonomous_planning():
     """
     Run every Sunday at 6am ET.

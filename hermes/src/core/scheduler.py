@@ -25,6 +25,7 @@ def register_core_jobs():
         consolidate_memories,
         pattern_analysis,
         autonomous_planning,
+        campaign_insights,
     )
     from src.integrations.telegram_bot import process_updates
 
@@ -64,6 +65,12 @@ def register_core_jobs():
             "func": autonomous_planning,
             "trigger": CronTrigger(day_of_week="sun", hour=6, minute=0, timezone="America/New_York"),
             "name": "Autonomous Weekly Planning",
+        },
+        {
+            "id": "campaign_insights",
+            "func": campaign_insights,
+            "trigger": CronTrigger(hour=9, minute=30, timezone="America/New_York"),
+            "name": "Campaign Insights AI",
         },
         {
             "id": "telegram_polling",

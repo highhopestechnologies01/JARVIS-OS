@@ -109,6 +109,18 @@ async def ingest(
 
     await db.commit()
     log.info("meta_ads.ingest", rdp_host=payload.rdp_host, profiles=saved)
+
+    # Run spend alerts (non-blocking background task)
+    try:
+        from src.core.spend_alerts import check_spend_alerts
+        import asyncio
+        profiles_dicts = [p.model_dump() for p in payload.profiles]
+        asyncio.create_task(
+            check_spend_alerts(db, profiles_dicts, payload.rdp_host, payload.scraped_at)
+        )
+    except Exception as e:
+        log.warning("meta_ads.ingest.alerts_skipped", error=str(e))
+
     return {"status": "ok", "profiles_ingested": saved}
 
 
@@ -354,3 +366,66 @@ async def report_command_result(
 
     log.info("meta_ads.command.result", id=cmd_id, status=payload.status)
     return {"id": cmd_id, "status": payload.status}
+
+
+# ── Budget Config ─────────────────────────────────────────────────────────────
+
+class BudgetConfigPayload(BaseModel):
+    enabled: bool = True
+    total_daily_cap: float = 0.0          # 0 = disabled
+    alert_pct: float = 80.0               # alert at this % of campaign budget
+    auto_pause_pct: float = 100.0         # auto-pause at this %
+    stopped_detection: bool = True
+    campaign_budgets: dict[str, float] = {}   # {"Campaign Name": daily_budget_usd}
+
+
+@router.get("/budget-config")
+async def get_budget_config(db: AsyncSession = Depends(get_db)):
+    """Return current spend alert config."""
+    from src.core.spend_alerts import load_config
+    cfg = await load_config(db)
+    return cfg
+
+
+@router.post("/budget-config")
+async def set_budget_config(
+    payload: BudgetConfigPayload,
+    db: AsyncSession = Depends(get_db),
+):
+    """Save spend alert config. Called by dashboard settings."""
+    from src.core.spend_alerts import save_config
+    cfg = payload.model_dump()
+    await save_config(db, cfg)
+    log.info("meta_ads.budget_config.saved", total_cap=payload.total_daily_cap)
+    return {"status": "ok", "config": cfg}
+
+
+# ── Campaign Insights ─────────────────────────────────────────────────────────
+
+@router.get("/insights")
+async def get_insights(db: AsyncSession = Depends(get_db)):
+    """Return latest stored AI campaign insights from Memory table."""
+    result = await db.execute(
+        select(Memory).where(Memory.type == "insight", Memory.topic == "campaign_insights")
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return {"available": False, "data": None, "updated_at": None}
+    try:
+        data = json.loads(row.content)
+    except Exception:
+        data = {"summary": row.content}
+    return {
+        "available": True,
+        "data": data,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+@router.post("/insights/run")
+async def run_insights(db: AsyncSession = Depends(get_db)):
+    """Manually trigger campaign insights analysis (for dashboard ▶ button)."""
+    from src.core.campaign_insights import insights_engine
+    import asyncio
+    asyncio.create_task(insights_engine.run(db))
+    return {"status": "queued"}
