@@ -620,6 +620,7 @@ async def fetch_via_meta_api(token: str, known_account_ids: list[str] = None) ->
                     total_clicks += clicks
                     campaigns.append({
                         "name": ins.get("campaign_name", ""),
+                        "campaign_id": ins.get("campaign_id", ""),
                         "status": "ACTIVE",
                         "spend": f"${spend:.2f}",
                         "impressions": str(impressions),
@@ -1383,50 +1384,82 @@ JS_TOGGLE_CAMPAIGN = """
 (function(campaignName, targetAction) {
     var targetOn = (targetAction === 'ACTIVATE');
 
-    // Walk all text nodes to find exact or partial match
-    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-    var node;
-    while (node = walker.nextNode()) {
-        var text = node.textContent.trim();
-        if (text === campaignName || text.indexOf(campaignName) !== -1) {
-            var el = node.parentElement;
-            // Walk up to find row (tr or role=row)
-            var row = null;
-            for (var i = 0; i < 12; i++) {
-                if (!el) break;
-                if (el.tagName === 'TR' || el.getAttribute('role') === 'row') {
-                    row = el;
-                    break;
+    function findRowForCampaign(name) {
+        // Primary: [role="row"] elements — works with React virtual tables
+        var rows = Array.from(document.querySelectorAll('[role="row"], tr'));
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].textContent.indexOf(name) !== -1) {
+                return rows[i];
+            }
+        }
+        // Fallback: text node walk → parent row
+        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        var node;
+        while (node = walker.nextNode()) {
+            var t = node.textContent.trim();
+            if (t === name || (name.length > 4 && t.indexOf(name) !== -1)) {
+                var el = node.parentElement;
+                for (var j = 0; j < 15; j++) {
+                    if (!el) break;
+                    if (el.tagName === 'TR' || el.getAttribute('role') === 'row') return el;
+                    el = el.parentElement;
                 }
-                el = el.parentElement;
             }
-            if (!row) continue;
+        }
+        return null;
+    }
 
-            // Find toggle: input[checkbox] or role=switch or aria-checked button
-            var toggles = row.querySelectorAll(
-                'input[type="checkbox"], [role="switch"], [aria-checked], button.x1i10hfl'
-            );
-            if (toggles.length === 0) continue;
+    var row = findRowForCampaign(campaignName);
+    if (!row) {
+        return JSON.stringify({ok: false, error: 'campaign_not_found_in_dom'});
+    }
 
-            var toggle = toggles[0];
-            var isOn = false;
-            if (toggle.type === 'checkbox') {
-                isOn = toggle.checked;
-            } else {
-                isOn = toggle.getAttribute('aria-checked') === 'true';
+    // Scroll row into view so React renders the toggle controls
+    row.scrollIntoView({behavior: 'instant', block: 'center'});
+
+    // Find toggle — prefer role=switch, then aria-checked, then checkbox
+    // Explicitly exclude the hardcoded FB class which rotates on deploys
+    var toggles = row.querySelectorAll('[role="switch"], [aria-checked], input[type="checkbox"]');
+    if (toggles.length === 0) {
+        return JSON.stringify({ok: false, error: 'no_toggle_in_row', rowText: row.textContent.slice(0, 80)});
+    }
+
+    var toggle = toggles[0];
+    var isOn = false;
+    if (toggle.tagName === 'INPUT' && toggle.type === 'checkbox') {
+        isOn = toggle.checked;
+    } else {
+        isOn = toggle.getAttribute('aria-checked') === 'true';
+    }
+
+    if (isOn === targetOn) {
+        return JSON.stringify({ok: true, already: true, state: isOn ? 'on' : 'off'});
+    }
+
+    // Use native .click() — triggers React synthetic event handlers
+    toggle.click();
+    return JSON.stringify({ok: true, clicked: true, from: isOn ? 'on' : 'off'});
+})(%s, %s)
+"""
+
+# Handles Meta's "Are you sure?" confirmation modals that appear after clicking a toggle
+JS_CONFIRM_DIALOG = """
+(function() {
+    var keywords = ['turn off', 'pause', 'confirm', 'ok', 'yes', 'deactivate'];
+    var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+    for (var i = 0; i < btns.length; i++) {
+        var text = btns[i].textContent.trim().toLowerCase();
+        if (keywords.some(function(k) { return text === k || text.indexOf(k) === 0; })) {
+            // Make sure it's visible
+            var rect = btns[i].getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                btns[i].click();
+                return JSON.stringify({ok: true, confirmed: true, btn: btns[i].textContent.trim()});
             }
-
-            if (isOn === targetOn) {
-                return JSON.stringify({ok: true, already: true, state: isOn ? 'on' : 'off'});
-            }
-
-            // Click the toggle
-            toggle.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-            return JSON.stringify({ok: true, clicked: true, from: isOn ? 'on' : 'off'});
         }
     }
-    return JSON.stringify({ok: false, error: 'campaign_not_found_in_dom'});
-})(%s, %s)
+    return JSON.stringify({ok: true, no_dialog: true});
+})()
 """
 
 
@@ -1434,7 +1467,12 @@ async def toggle_campaign_via_cdp(debug_port: str, campaign_name: str, action: s
     """
     Connect to a Chrome debug port, find the Ads Manager tab, and click
     the campaign's On/Off toggle via CDP Runtime.evaluate.
+
+    Two-step process:
+      1. JS_TOGGLE_CAMPAIGN — scroll row into view, click the toggle
+      2. JS_CONFIRM_DIALOG  — dismiss Meta's "Are you sure?" modal if it appears
     """
+    import asyncio
     import websockets as _ws
 
     try:
@@ -1442,13 +1480,20 @@ async def toggle_campaign_via_cdp(debug_port: str, campaign_name: str, action: s
     except Exception as e:
         return {"ok": False, "error": f"cdp_get_tabs failed: {e}"}
 
-    # Find an Ads Manager campaigns tab
+    # Find an Ads Manager campaigns tab — accept any ads manager URL
     am_tab = None
     for tab in tabs:
         url = tab.get("url", "")
-        if "adsmanager.facebook.com" in url and "campaigns" in url:
-            am_tab = tab
-            break
+        if "adsmanager.facebook.com" in url or "business.facebook.com" in url:
+            if "campaigns" in url or "ads" in url:
+                am_tab = tab
+                break
+    # Broader fallback: any Ads Manager tab
+    if not am_tab:
+        for tab in tabs:
+            if "adsmanager.facebook.com" in tab.get("url", ""):
+                am_tab = tab
+                break
 
     if not am_tab:
         return {"ok": False, "error": "no_ads_manager_tab"}
@@ -1458,16 +1503,34 @@ async def toggle_campaign_via_cdp(debug_port: str, campaign_name: str, action: s
         return {"ok": False, "error": "no_ws_url"}
 
     try:
-        async with _ws.connect(ws_url, ping_interval=None, close_timeout=5) as ws:
+        async with _ws.connect(ws_url, ping_interval=None, close_timeout=10) as ws:
+            # Step 1: click the toggle
             js = JS_TOGGLE_CAMPAIGN % (
                 json.dumps(campaign_name),
                 json.dumps(action),
             )
             raw = await cdp_eval(ws, js, timeout=15)
-            if raw:
-                result = json.loads(raw)
-                return result
-            return {"ok": False, "error": "no_result_from_js"}
+            if not raw:
+                return {"ok": False, "error": "no_result_from_toggle_js"}
+
+            result = json.loads(raw)
+
+            if not result.get("ok"):
+                return result   # campaign not found or other error
+
+            if result.get("already"):
+                return result   # already in correct state, no confirm needed
+
+            # Step 2: wait for Meta's confirmation modal, then dismiss it
+            await asyncio.sleep(1.5)
+            conf_raw = await cdp_eval(ws, JS_CONFIRM_DIALOG, timeout=10)
+            conf = json.loads(conf_raw) if conf_raw else {"ok": True, "no_dialog": True}
+            result["confirm"] = conf
+
+            # Brief pause to let the UI update
+            await asyncio.sleep(0.5)
+            return result
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
