@@ -110,14 +110,21 @@ async def ingest(
     await db.commit()
     log.info("meta_ads.ingest", rdp_host=payload.rdp_host, profiles=saved)
 
-    # Run spend alerts (non-blocking background task)
+    # Run spend alerts (non-blocking background task — uses its own DB session)
     try:
         from src.core.spend_alerts import check_spend_alerts
+        from src.db.connection import AsyncSessionLocal
         import asyncio
+
         profiles_dicts = [p.model_dump() for p in payload.profiles]
-        asyncio.create_task(
-            check_spend_alerts(db, profiles_dicts, payload.rdp_host, payload.scraped_at)
-        )
+        rdp_host = payload.rdp_host
+        scraped_at = payload.scraped_at
+
+        async def _run_alerts():
+            async with AsyncSessionLocal() as alert_db:
+                await check_spend_alerts(alert_db, profiles_dicts, rdp_host, scraped_at)
+
+        asyncio.create_task(_run_alerts())
     except Exception as e:
         log.warning("meta_ads.ingest.alerts_skipped", error=str(e))
 
@@ -423,9 +430,15 @@ async def get_insights(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/insights/run")
-async def run_insights(db: AsyncSession = Depends(get_db)):
+async def run_insights():
     """Manually trigger campaign insights analysis (for dashboard ▶ button)."""
     from src.core.campaign_insights import insights_engine
+    from src.db.connection import AsyncSessionLocal
     import asyncio
-    asyncio.create_task(insights_engine.run(db))
+
+    async def _run():
+        async with AsyncSessionLocal() as bg_db:
+            await insights_engine.run(bg_db)
+
+    asyncio.create_task(_run())
     return {"status": "queued"}
