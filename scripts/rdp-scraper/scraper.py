@@ -1,5 +1,5 @@
 """
-JARVIS Meta Ads Scraper v3 — runs on RDP machines (Windows).
+JARVIS Meta Ads Scraper v4 — runs on RDP machines (Windows).
 
 Strategy:
   1. Query Ads Power local API for active browser profiles
@@ -13,6 +13,14 @@ Strategy:
   6. Call Meta Marketing API with captured token
   7. Fallback: DOM scrape the current page
   8. POST results to Hermes
+  9. Send Telegram summary to JARVIS bot
+
+v4 improvements:
+  - Retry failed profiles (configurable count + delay)
+  - Smarter session health detection (logged-out, checkpoint, blocked)
+  - Telegram summary after every run (spend, campaigns, profile status)
+  - Better error categorization — tells you exactly WHY a profile failed
+  - Timeout guard on each profile scrape (3 min max)
 
 NO RELOADS. NO NAVIGATION. Working with the page as-is preserves auth.
 Run every 5 minutes via Windows Task Scheduler.
@@ -41,6 +49,120 @@ def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM if present
         return json.load(f)
 
+
+# ── Session health detection ──────────────────────────────────────────────────
+
+SESSION_BAD_PATTERNS = [
+    "loginpage", "/login?", "checkpoint", "recover", "two_step",
+    "unsupportedbrowser", "blocked", "disabled", "suspended",
+    "chrome-error://", "about:blank", "newtab", "chromewebdata",
+]
+
+SESSION_LOGGED_OUT_KEYWORDS = [
+    "Log in to Facebook", "Create new account", "Forgotten password",
+    "Email or phone number", "Enter your password", "Log into Facebook",
+    "Sign up for Facebook",
+]
+
+SESSION_CHECKPOINT_KEYWORDS = [
+    "We noticed unusual activity", "Your account has been locked",
+    "Confirm your identity", "Security check required",
+    "We need to verify", "account is temporarily locked",
+]
+
+
+def classify_session(url: str, body_text: str = "") -> str:
+    """
+    Returns: 'ok' | 'logged_out' | 'checkpoint' | 'bad_url' | 'no_fb_tab'
+    """
+    url_lower = url.lower()
+    if any(p in url_lower for p in SESSION_BAD_PATTERNS):
+        return "bad_url"
+    for kw in SESSION_LOGGED_OUT_KEYWORDS:
+        if kw in body_text:
+            return "logged_out"
+    for kw in SESSION_CHECKPOINT_KEYWORDS:
+        if kw in body_text:
+            return "checkpoint"
+    return "ok"
+
+
+# ── Telegram notifications ────────────────────────────────────────────────────
+
+async def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
+    """Send a message directly to Telegram from the scraper."""
+    if not bot_token or not chat_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            )
+            return r.status_code == 200
+    except Exception as e:
+        print(f"[WARN] Telegram send failed: {e}")
+        return False
+
+
+def build_scrape_summary(rdp_host: str, scraped: list[dict], elapsed: float) -> str:
+    """Build a Telegram-formatted summary of the scrape run."""
+    total_spend = 0.0
+    total_campaigns = 0
+    total_active = 0
+    ok_profiles = []
+    failed_profiles = []
+
+    for p in scraped:
+        name = p.get("profile_name") or p.get("profile_id", "?")
+        err = p.get("error")
+        campaigns = p.get("campaigns", [])
+        summary = p.get("summary", {})
+
+        spend = summary.get("total_spend", 0) or 0
+        active = summary.get("active_campaigns", 0) or 0
+
+        if err and not campaigns:
+            # Classify the failure
+            if "logged_out" in str(err):
+                failed_profiles.append(f"🔐 {name} — logged out")
+            elif "checkpoint" in str(err):
+                failed_profiles.append(f"🚫 {name} — checkpoint/blocked")
+            elif "No usable Facebook tab" in str(err) or "no_fb_tab" in str(err):
+                failed_profiles.append(f"🌐 {name} — no FB tab open")
+            elif "empty account" in str(err):
+                failed_profiles.append(f"📭 {name} — empty account")
+            else:
+                short_err = str(err)[:60]
+                failed_profiles.append(f"❌ {name} — {short_err}")
+        else:
+            total_spend += spend
+            total_campaigns += len(campaigns)
+            total_active += active
+            ok_profiles.append(f"✅ {name} — ${spend:,.2f} | {active} active")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"📊 <b>Meta Ads Scrape — {rdp_host}</b>",
+        f"<i>{now} · {elapsed:.0f}s</i>",
+        "",
+        f"💰 Total Spend: <b>${total_spend:,.2f}</b>",
+        f"▶️ Active Campaigns: <b>{total_active}</b>",
+        f"📋 Total Campaigns: <b>{total_campaigns}</b>",
+        "",
+    ]
+
+    if ok_profiles:
+        lines.append("<b>Profiles:</b>")
+        lines.extend(ok_profiles)
+
+    if failed_profiles:
+        lines.append("")
+        lines.append("<b>⚠️ Issues:</b>")
+        lines.extend(failed_profiles)
+
+    return "\n".join(lines)
+
 # ── Ads Power / Port discovery ────────────────────────────────────────────────
 
 async def get_active_profiles(adspower_url: str, fixed_ports: list[int] = None) -> list[dict]:
@@ -68,19 +190,14 @@ async def get_active_profiles(adspower_url: str, fixed_ports: list[int] = None) 
                     print(f"  port {port}: unreachable ({e})")
 
     try:
+        # Use local-active endpoint — returns all open browsers + their debug ports in one call
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{adspower_url}/api/v1/user/list",
-                                 params={"page": 1, "page_size": 100})
-            profiles = r.json().get("data", {}).get("list", [])
-            for p in profiles:
-                uid = p.get("user_id") or p.get("id")
-                if not uid:
-                    continue
-                r2 = await client.get(f"{adspower_url}/api/v1/browser/active",
-                                      params={"user_id": uid})
-                data = r2.json().get("data", {})
-                if data.get("status") == "Active":
-                    port_str = str(data.get("debug_port", ""))
+            r = await client.get(f"{adspower_url}/api/v1/browser/local-active")
+            data = r.json()
+            if data.get("code") == 0:
+                for p in data.get("data", {}).get("list", []):
+                    uid = p.get("user_id", "")
+                    port_str = str(p.get("debug_port", ""))
                     if port_str and port_str not in known_ports:
                         active.append({
                             "user_id": uid,
@@ -88,6 +205,7 @@ async def get_active_profiles(adspower_url: str, fixed_ports: list[int] = None) 
                             "debug_port": port_str,
                         })
                         known_ports.add(port_str)
+                        print(f"  AdsPower: user {uid} → port {port_str}")
     except Exception as e:
         print(f"[WARN] Ads Power API error: {e}")
 
@@ -893,20 +1011,27 @@ async def scrape_profile(profile: dict) -> dict:
 
         if not ads_tabs:
             fb_urls = [t.get("url", "")[:60] for t in tabs if "facebook.com" in t.get("url", "")]
-            result["error"] = f"No usable Facebook tab (all login/blocked): {fb_urls}"
-            print(f"  Skipping — all Facebook tabs are login/blocked")
+            result["error"] = "no_fb_tab"
+            print(f"  Skipping — no usable Facebook tabs")
             print(f"  ACTION NEEDED: Open adsmanager.facebook.com in this profile manually")
             return result
 
         print(f"  Found {len(ads_tabs)} Ads Manager tab(s) — will try each")
 
-        # Try each tab; skip empty accounts, use first one with campaign data
+        # Try each tab; skip empty/logged-out accounts, use first one with campaign data
         ads_tab = None
         for candidate in ads_tabs:
             cand_url = candidate.get("url", "")
             cand_ws = candidate.get("webSocketDebuggerUrl")
             if not cand_ws:
                 continue
+
+            # Quick URL-level session check
+            session_status = classify_session(cand_url)
+            if session_status == "bad_url":
+                print(f"  SKIP tab (bad URL): {cand_url[:60]}")
+                continue
+
             acct_ids = re.findall(r'act[_=](\d+)', cand_url)
             print(f"  Checking tab: act={acct_ids} — {cand_url[:80]}")
             try:
@@ -914,6 +1039,20 @@ async def scrape_profile(profile: dict) -> dict:
                     cand_ws, ping_interval=None, open_timeout=10, close_timeout=3
                 ) as pw_check:
                     await cdp_send(pw_check, "Runtime.enable")
+
+                    # Check session health via page body text
+                    body_text_raw = await cdp_eval(pw_check, "(function(){return document.body.innerText.slice(0,2000);})()")
+                    if body_text_raw:
+                        session_status = classify_session(cand_url, body_text_raw)
+                        if session_status == "logged_out":
+                            print(f"  SKIP: profile is logged out — open AdsPower and log back in")
+                            result["error"] = "logged_out"
+                            continue
+                        if session_status == "checkpoint":
+                            print(f"  SKIP: Facebook checkpoint/security check — manual action needed")
+                            result["error"] = "checkpoint"
+                            continue
+
                     dismissed = await cdp_eval(pw_check, JS_DISMISS_MODALS)
                     if dismissed and dismissed != "nothing_dismissed":
                         print(f"    Dismissed modals: {dismissed}")
@@ -1186,6 +1325,58 @@ async def scrape_profile(profile: dict) -> dict:
 
     return result
 
+# ── Retry wrapper ─────────────────────────────────────────────────────────────
+
+async def scrape_profile_with_retry(profile: dict, retry_count: int = 2, retry_delay: int = 30) -> dict:
+    """
+    Scrape a profile with automatic retry on failure.
+    Skips retry for unrecoverable errors (logged_out, checkpoint, no_fb_tab).
+    """
+    NO_RETRY_ERRORS = {"logged_out", "checkpoint", "no_fb_tab", "All Ads Manager tabs are empty accounts"}
+
+    last_result = None
+    for attempt in range(retry_count + 1):
+        if attempt > 0:
+            print(f"\n  [RETRY {attempt}/{retry_count}] Waiting {retry_delay}s before retry...")
+            await asyncio.sleep(retry_delay)
+            print(f"  [RETRY {attempt}/{retry_count}] Retrying {profile['name']}...")
+
+        try:
+            result = await asyncio.wait_for(
+                scrape_profile(profile),
+                timeout=180.0,  # 3 min hard cap per profile
+            )
+        except asyncio.TimeoutError:
+            result = {
+                "profile_id": profile["user_id"],
+                "profile_name": profile["name"],
+                "ad_account_id": None,
+                "ad_account_name": None,
+                "campaigns": [],
+                "summary": {},
+                "error": "Timeout (3 min) — profile scrape took too long",
+            }
+
+        last_result = result
+
+        # If we got campaign data, we're done
+        if result.get("campaigns"):
+            if attempt > 0:
+                print(f"  ✓ Retry {attempt} succeeded for {profile['name']}")
+            return result
+
+        # Check if error is unrecoverable — don't retry
+        err = result.get("error", "")
+        if any(no_retry in str(err) for no_retry in NO_RETRY_ERRORS):
+            print(f"  ✗ Not retrying {profile['name']}: {err}")
+            return result
+
+        if attempt < retry_count:
+            print(f"  ✗ Attempt {attempt + 1} failed for {profile['name']}: {err}")
+
+    return last_result
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -1195,9 +1386,14 @@ async def main():
     rdp_host = config["rdp_host"]
     adspower_url = config.get("adspower_url", "http://localhost:50325")
     max_concurrent = config.get("max_concurrent_profiles", 3)
+    retry_count = config.get("retry_count", 2)
+    retry_delay = config.get("retry_delay_seconds", 30)
+    tg_token = config.get("telegram_bot_token", "")
+    tg_chat_id = config.get("telegram_chat_id", "")
 
-    print(f"=== JARVIS Meta Ads Scraper v3 — {rdp_host} ===")
-    print(f"Hermes: {hermes_url}")
+    start_time = asyncio.get_event_loop().time()
+    print(f"=== JARVIS Meta Ads Scraper v4 — {rdp_host} ===")
+    print(f"Hermes: {hermes_url} | Retries: {retry_count} | Delay: {retry_delay}s")
 
     # ── Control check: bail out if dashboard has disabled the scraper ──────────
     try:
@@ -1213,27 +1409,36 @@ async def main():
     profiles = await get_active_profiles(adspower_url, fixed_ports=fixed_ports)
     if not profiles:
         print("[WARN] No active Ads Power profiles found.")
+        if tg_token and tg_chat_id:
+            await send_telegram(tg_token, tg_chat_id,
+                f"⚠️ <b>Meta Scraper — {rdp_host}</b>\n\nNo active AdsPower profiles found.\nOpen AdsPower and start your browser profiles.")
         return
 
     print(f"Found {len(profiles)} active profiles: {[p['name'] for p in profiles]}")
 
     sem = asyncio.Semaphore(max_concurrent)
+
     async def scrape_with_sem(p):
         async with sem:
-            return await scrape_profile(p)
+            return await scrape_profile_with_retry(p, retry_count=retry_count, retry_delay=retry_delay)
 
     scraped = await asyncio.gather(*[scrape_with_sem(p) for p in profiles])
+    scraped = list(scraped)
 
+    elapsed = asyncio.get_event_loop().time() - start_time
+
+    # ── Ingest to Hermes ───────────────────────────────────────────────────────
     payload = {
         "rdp_host": rdp_host,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
-        "profiles": list(scraped),
+        "profiles": scraped,
     }
 
     headers = {"Content-Type": "application/json"}
     if scraper_token:
         headers["X-Scraper-Token"] = scraper_token
 
+    ingest_ok = False
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -1242,13 +1447,28 @@ async def main():
                 headers=headers,
             )
             if r.status_code == 200:
-                print(f"\n✓ Ingested {r.json().get('profiles_ingested')} profiles into Hermes")
+                ingested = r.json().get("profiles_ingested", "?")
+                print(f"\n✓ Ingested {ingested} profiles into Hermes")
+                ingest_ok = True
             else:
                 print(f"\n✗ Hermes ingest failed: HTTP {r.status_code} — {r.text[:200]}")
     except Exception as e:
         print(f"\n✗ Failed to POST to Hermes: {e}")
 
-    print("=== Done ===")
+    # ── Telegram summary ───────────────────────────────────────────────────────
+    if tg_token and tg_chat_id:
+        summary_msg = build_scrape_summary(rdp_host, scraped, elapsed)
+        if not ingest_ok:
+            summary_msg += "\n\n⚠️ <i>Hermes ingest failed — data not stored</i>"
+        sent = await send_telegram(tg_token, tg_chat_id, summary_msg)
+        if sent:
+            print("✓ Telegram summary sent to JARVIS")
+        else:
+            print("✗ Telegram summary failed")
+    else:
+        print("[INFO] No telegram_bot_token/telegram_chat_id in config — skipping notification")
+
+    print(f"=== Done in {elapsed:.0f}s ===")
 
 if __name__ == "__main__":
     asyncio.run(main())

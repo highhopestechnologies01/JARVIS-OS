@@ -1,7 +1,12 @@
 {
   "rdp_host": "RDP-1",
   "hermes_url": "http://162.35.161.135:8001",
-  "scraper_token": "your_scraper_token_here",
+  "scraper_token": "",
   "adspower_url": "http://localhost:50325",
-  "max_concurrent_profiles": 3
+  "max_concurrent_profiles": 3,
+  "fixed_ports": [],
+  "retry_count": 2,
+  "retry_delay_seconds": 30,
+  "telegram_bot_token": "8643606355:AAEAGlkaMW3lzJZpjGcEleQGTiGIglmLPbI",
+  "telegram_chat_id": "8671622639"
 }
