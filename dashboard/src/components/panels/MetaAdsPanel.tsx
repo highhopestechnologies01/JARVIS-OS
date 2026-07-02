@@ -172,6 +172,7 @@ interface BudgetConfig {
   alert_pct: number;
   auto_pause_pct: number;
   stopped_detection: boolean;
+  alert_cooldown_hours: number;
   campaign_budgets: Record<string, number>;
 }
 
@@ -181,6 +182,7 @@ const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
   alert_pct: 80,
   auto_pause_pct: 100,
   stopped_detection: true,
+  alert_cooldown_hours: 4,
   campaign_budgets: {},
 };
 
@@ -260,11 +262,12 @@ function BudgetConfigPanel({ hermes }: { hermes: string }) {
           </div>
 
           {/* Numeric thresholds */}
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 gap-2">
             {[
               { label: "Alert at %", key: "alert_pct" as const, hint: "Send alert when spend hits this % of budget" },
               { label: "Auto-pause at %", key: "auto_pause_pct" as const, hint: "Queue PAUSE when spend hits this %" },
-              { label: "Daily Cap $", key: "total_daily_cap" as const, hint: "Alert when total daily spend across all profiles hits this (0 = off)" },
+              { label: "Daily Cap $", key: "total_daily_cap" as const, hint: "Alert when total daily spend hits this (0 = off)" },
+              { label: "Cooldown (hrs)", key: "alert_cooldown_hours" as const, hint: "Suppress repeat alerts for the same campaign within this many hours" },
             ].map(({ label, key, hint }) => (
               <div key={key}>
                 <label className="text-jarvis-muted text-xs block mb-1" title={hint}>{label}</label>

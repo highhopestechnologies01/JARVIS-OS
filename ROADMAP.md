@@ -166,7 +166,55 @@ Mac environment fully configured.
 
 ---
 
+## Meta Ads Intelligence Layer ✅ COMPLETE
+
+**Completed: 2026-07-01**
+
+- [x] `spend_alerts.py` — budget % alert, auto-pause, stopped-campaign detection, daily cap
+- [x] `campaign_insights.py` — daily Claude Haiku analysis → Telegram + Memory table
+- [x] `meta_ads.py` — `/budget-config` GET+POST, `/insights` GET, `/insights/run` POST
+- [x] `notifications.py` — `reply_markup` support for Telegram inline keyboards
+- [x] `jobs.py` — `campaign_insights` APScheduler job (9:30am ET daily)
+- [x] `scheduler.py` — campaign_insights registered
+- [x] `MetaAdsPanel.tsx` — date picker, campaign filter, Pause/Activate buttons per campaign
+- [x] `MetaAdsPanel.tsx` — Campaign Insights panel with ▶ Run Now button
+- [x] `MetaAdsPanel.tsx` — Budget Config UI (alert%, auto-pause%, daily cap, per-campaign budgets)
+- [x] Telegram inline keyboards on all alerts — ⏸ Pause Now / ✅ Dismiss buttons
+- [x] `/menu` command with full clickable button grid
+- [x] Duplicate scraper Task Scheduler entries on RDPs removed
+- [x] `setMyCommands` — bot command list registered with Telegram
+
+---
+
 ## Session Log
+
+### Session Report — 2026-07-01 (Meta Ads Intelligence)
+#### Completed
+- Fixed duplicate FAST SPEND alerts: two Task Scheduler entries on each RDP — deleted 6/30 duplicates
+- Fixed root cause: outdated scraper.py on RDPs had inline alert logic — re-downloaded from GitHub on both
+- Rewrote telegram_bot.py: inline keyboard buttons throughout, /menu grid, callback_query handling, setMyCommands
+- Built spend_alerts.py: budget % alert, auto-pause queue, stopped-campaign detection, daily cap alert
+- Updated notifications.py: reply_markup support in send_telegram()
+- Updated meta_ads.py: spend alerts hooked into /ingest (non-blocking asyncio.create_task), budget-config endpoints
+- Built campaign_insights.py: Claude Haiku daily analysis of all campaign data → Telegram + Memory
+- Updated jobs.py: campaign_insights job at 9:30am ET
+- Updated scheduler.py: campaign_insights registered
+- Added /insights and /insights/run endpoints to meta_ads.py
+- Updated MetaAdsPanel.tsx: date picker, campaign filter, per-campaign Pause/Activate buttons, Insights panel, Budget Config UI
+#### Files Modified
+- hermes/src/integrations/telegram_bot.py
+- hermes/src/core/spend_alerts.py (new)
+- hermes/src/core/campaign_insights.py (new)
+- hermes/src/core/notifications.py
+- hermes/src/core/jobs.py
+- hermes/src/core/scheduler.py
+- hermes/src/api/routes/meta_ads.py
+- dashboard/src/components/panels/MetaAdsPanel.tsx
+#### Next Session Priority
+- Verify CI/CD deploy on VPS: check `docker logs jarvis-hermes` for startup errors
+- Test campaign insights manually: POST /api/v1/meta-ads/insights/run
+- Set up per-campaign budgets in Budget Config UI once RDPs have data
+- Consider: alert deduplication (don't re-fire same alert every 5 min)
 
 ### 2026-06-29
 - Created repository from scratch

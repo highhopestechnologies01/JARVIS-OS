@@ -383,6 +383,7 @@ class BudgetConfigPayload(BaseModel):
     alert_pct: float = 80.0               # alert at this % of campaign budget
     auto_pause_pct: float = 100.0         # auto-pause at this %
     stopped_detection: bool = True
+    alert_cooldown_hours: float = 4.0     # suppress repeat alerts within this window
     campaign_budgets: dict[str, float] = {}   # {"Campaign Name": daily_budget_usd}
 
 

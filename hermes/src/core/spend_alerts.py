@@ -7,12 +7,15 @@ Checks:
 3. Total daily spend across all profiles ≥ total_daily_cap → alert
 4. Campaign suddenly stopped (had spend last cycle, now $0, still active) → alert
 
+Deduplication: each alert type per campaign is suppressed within `alert_cooldown_hours`
+(default 4h) to prevent spam on every 5-minute scrape cycle.
+
 Budget config is stored in Memory table (type="config", topic="spend_alerts_config").
-Default config applied if none set.
+Cooldown state stored in Memory table (type="alert_cooldown", topic="{key}").
 """
 
 import json
-from datetime import datetime, timezone, timedelta, date as date_type
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import structlog
@@ -30,6 +33,7 @@ DEFAULT_CONFIG = {
     "auto_pause_pct": 100,            # auto-pause at 100% of budget
     "campaign_budgets": {},           # {"Campaign Name": daily_budget_usd}
     "stopped_detection": True,        # alert when active campaign drops to $0
+    "alert_cooldown_hours": 4,        # suppress repeat alerts within this window
 }
 
 
@@ -62,6 +66,77 @@ async def save_config(db: AsyncSession, config: dict) -> None:
         row.content = content
     await db.commit()
 
+
+# ── Cooldown helpers ──────────────────────────────────────────────────────────
+
+def _cooldown_key(rdp_host: str, profile_id: str, campaign_name: str, alert_type: str) -> str:
+    """Unique key identifying one (campaign, alert_type) pair."""
+    # Truncate campaign name to keep key manageable
+    safe_name = campaign_name[:60].replace(":", "_")
+    return f"{rdp_host}:{profile_id}:{safe_name}:{alert_type}"
+
+
+async def _is_on_cooldown(
+    db: AsyncSession, key: str, cooldown_hours: float
+) -> bool:
+    """Return True if this alert key was fired within the cooldown window."""
+    result = await db.execute(
+        select(Memory).where(Memory.type == "alert_cooldown", Memory.topic == key)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return False
+    try:
+        data = json.loads(row.content)
+        last_fired = datetime.fromisoformat(data["last_fired"])
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+        return last_fired > cutoff
+    except Exception:
+        return False
+
+
+async def _mark_fired(db: AsyncSession, key: str, cooldown_hours: float) -> None:
+    """Record that this alert key just fired. Expires after cooldown window."""
+    result = await db.execute(
+        select(Memory).where(Memory.type == "alert_cooldown", Memory.topic == key)
+    )
+    row = result.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    content = json.dumps({"last_fired": now.isoformat()})
+    expires = now + timedelta(hours=cooldown_hours)
+
+    if row is None:
+        row = Memory(
+            type="alert_cooldown",
+            topic=key,
+            content=content,
+            importance=1,
+            expires_at=expires,
+        )
+        db.add(row)
+    else:
+        row.content = content
+        row.expires_at = expires
+    await db.commit()
+
+
+async def _send_if_not_cooled(
+    db: AsyncSession,
+    key: str,
+    cooldown_hours: float,
+    msg: str,
+    kb: dict | None = None,
+) -> bool:
+    """Send alert only if not in cooldown. Returns True if sent."""
+    if await _is_on_cooldown(db, key, cooldown_hours):
+        log.debug("spend_alerts.suppressed", key=key, cooldown_hours=cooldown_hours)
+        return False
+    await _send_alert(msg, kb)
+    await _mark_fired(db, key, cooldown_hours)
+    return True
+
+
+# ── Core helpers ──────────────────────────────────────────────────────────────
 
 def _parse_spend(spend_str: str | None) -> float:
     """Parse spend string like '$12.34' or '12.34' to float."""
@@ -131,6 +206,8 @@ def _pause_kb(rdp_host: str, profile_id: str, campaign_name: str) -> dict:
     }
 
 
+# ── Main entry point ──────────────────────────────────────────────────────────
+
 async def check_spend_alerts(
     db: AsyncSession,
     profiles: list[dict],
@@ -150,6 +227,7 @@ async def check_spend_alerts(
     total_daily_cap: float = cfg.get("total_daily_cap", 0.0)
     campaign_budgets: dict = cfg.get("campaign_budgets", {})
     stopped_detection: bool = cfg.get("stopped_detection", True)
+    cooldown_hours: float = cfg.get("alert_cooldown_hours", 4)
 
     total_today_spend = 0.0
 
@@ -189,20 +267,26 @@ async def check_spend_alerts(
                 pct_used = (spend / budget) * 100
 
                 if pct_used >= auto_pause_pct:
-                    # Auto-pause
-                    await _queue_pause(db, rdp_host, profile_id, name)
-                    msg = (
-                        f"🚨 <b>AUTO-PAUSED</b> — Budget limit reached\n"
-                        f"📊 <b>{name}</b>\n"
-                        f"💰 Spent: <b>${spend:,.2f}</b> / ${budget:,.2f} budget "
-                        f"(<b>{pct_used:.0f}%</b>)\n"
-                        f"🖥 {rdp_host} · {profile_name}\n"
-                        f"<i>Campaign paused via CDP — will execute on next scraper run</i>"
-                    )
-                    await _send_alert(msg)
-                    log.info("spend_alerts.auto_pause", campaign=name, pct=pct_used)
+                    # Auto-pause — cooldown prevents queuing PAUSE every cycle
+                    key = _cooldown_key(rdp_host, profile_id, name, "auto_pause")
+                    if not await _is_on_cooldown(db, key, cooldown_hours):
+                        await _queue_pause(db, rdp_host, profile_id, name)
+                        msg = (
+                            f"🚨 <b>AUTO-PAUSED</b> — Budget limit reached\n"
+                            f"📊 <b>{name}</b>\n"
+                            f"💰 Spent: <b>${spend:,.2f}</b> / ${budget:,.2f} budget "
+                            f"(<b>{pct_used:.0f}%</b>)\n"
+                            f"🖥 {rdp_host} · {profile_name}\n"
+                            f"<i>Campaign paused via CDP — will execute on next scraper run</i>"
+                        )
+                        await _send_alert(msg)
+                        await _mark_fired(db, key, cooldown_hours)
+                        log.info("spend_alerts.auto_pause", campaign=name, pct=pct_used)
+                    else:
+                        log.debug("spend_alerts.auto_pause.suppressed", campaign=name)
 
                 elif pct_used >= alert_pct:
+                    key = _cooldown_key(rdp_host, profile_id, name, "budget_alert")
                     msg = (
                         f"⚠️ <b>Budget Alert</b> — {pct_used:.0f}% spent\n"
                         f"📊 <b>{name}</b>\n"
@@ -210,8 +294,9 @@ async def check_spend_alerts(
                         f"🖥 {rdp_host} · {profile_name}"
                     )
                     kb = _pause_kb(rdp_host, profile_id, name)
-                    await _send_alert(msg, kb)
-                    log.info("spend_alerts.budget_alert", campaign=name, pct=pct_used)
+                    sent = await _send_if_not_cooled(db, key, cooldown_hours, msg, kb)
+                    if sent:
+                        log.info("spend_alerts.budget_alert", campaign=name, pct=pct_used)
 
             # ── Stopped campaign detection ────────────────────────────────────
             if stopped_detection and _is_active(status):
@@ -219,6 +304,7 @@ async def check_spend_alerts(
                 if prev:
                     prev_spend = _parse_spend(prev.get("spend"))
                     if prev_spend > 0 and spend == 0:
+                        key = _cooldown_key(rdp_host, profile_id, name, "stopped")
                         msg = (
                             f"🛑 <b>Campaign Stopped</b>\n"
                             f"📊 <b>{name}</b> was spending but dropped to $0\n"
@@ -227,11 +313,13 @@ async def check_spend_alerts(
                             f"Status still shows: {status}"
                         )
                         kb = _pause_kb(rdp_host, profile_id, name)
-                        await _send_alert(msg, kb)
-                        log.info("spend_alerts.campaign_stopped", campaign=name)
+                        sent = await _send_if_not_cooled(db, key, cooldown_hours, msg, kb)
+                        if sent:
+                            log.info("spend_alerts.campaign_stopped", campaign=name)
 
     # ── Total daily cap check ─────────────────────────────────────────────────
     if total_daily_cap > 0 and total_today_spend >= total_daily_cap:
+        key = _cooldown_key(rdp_host, "all", "total", "daily_cap")
         msg = (
             f"🚨 <b>Daily Cap Hit!</b>\n"
             f"💰 Total spend: <b>${total_today_spend:,.2f}</b> "
@@ -239,5 +327,6 @@ async def check_spend_alerts(
             f"🖥 {rdp_host}\n"
             f"<i>Review all active campaigns immediately.</i>"
         )
-        await _send_alert(msg)
-        log.info("spend_alerts.daily_cap_hit", total=total_today_spend, cap=total_daily_cap)
+        sent = await _send_if_not_cooled(db, key, cooldown_hours, msg)
+        if sent:
+            log.info("spend_alerts.daily_cap_hit", total=total_today_spend, cap=total_daily_cap)
