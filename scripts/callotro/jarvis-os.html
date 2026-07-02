@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="120">
+  <title>Callotro Buyer View — JARVIS</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d0d0d; color: #e8e8e8;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px; line-height: 1.4;
+      padding: 16px;
+    }
+    h1 { font-size: 18px; font-weight: 600; color: #fff; margin-bottom: 4px; }
+    .meta { font-size: 11px; color: #666; margin-bottom: 20px; }
+    .meta span { color: #999; }
+
+    /* Ring group cards */
+    .rg-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px; }
+    .rg-card {
+      background: #161616; border: 1px solid #2a2a2a; border-radius: 8px;
+      padding: 14px;
+    }
+    .rg-card h2 { font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px; }
+    .rg-card.total { border-color: #2d3a2d; background: #141a14; }
+    .rg-card.total h2 { color: #5a9a5a; }
+
+    .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
+    .stat-label { color: #777; }
+    .stat-val { font-weight: 600; color: #e8e8e8; }
+    .stat-val.green { color: #5cb85c; }
+    .stat-val.yellow { color: #f0ad4e; }
+    .stat-val.blue { color: #5bc0de; }
+
+    /* TFN table */
+    h3 { font-size: 14px; font-weight: 600; color: #ccc; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { background: #1a1a1a; color: #888; font-weight: 600; text-align: left; padding: 8px 10px; border-bottom: 1px solid #2a2a2a; white-space: nowrap; }
+    td { padding: 7px 10px; border-bottom: 1px solid #1e1e1e; color: #ccc; }
+    tr:hover td { background: #181818; }
+    .delta-pos { color: #5cb85c; }
+    .delta-neg { color: #d9534f; }
+    .delta-neu { color: #888; }
+    .pill {
+      display: inline-block; padding: 2px 7px; border-radius: 10px;
+      font-size: 11px; font-weight: 600; background: #1e2e1e; color: #5cb85c;
+    }
+    .no-data { text-align: center; padding: 40px; color: #555; }
+  </style>
+</head>
+<body>
+
+<h1>📞 Callotro Buyer View Dashboard</h1>
+<p class="meta">
+  Auto-refreshes every 2 min &nbsp;·&nbsp;
+  Last synced: <span id="sync-time">—</span> &nbsp;·&nbsp;
+  CDR date: <span id="cdr-date">—</span>
+</p>
+
+<div class="rg-grid" id="rg-grid"></div>
+
+<h3>TFN Performance</h3>
+<div id="tfn-wrap">
+  <p class="no-data">No data — run notion-sync.py to populate</p>
+</div>
+
+<script>
+/* JARVIS_DATA_START — auto-updated by daily Notion sync */
+const __JARVIS_SYNC__ = { lastSynced: 'never', source: '', cdrDate: '' };
+const ringGroups = {
+  normal:   { buyers: 0, active: 0, totalCC: 0, activeCC: 0, liveCC: 0, availCC: 0, dailyCap: 0 },
+  premium:  { buyers: 0, active: 0, totalCC: 0, activeCC: 0, liveCC: 0, availCC: 0, dailyCap: 0 },
+  total:    { buyers: 0, active: 0, totalCC: 0, activeCC: 0, liveCC: 0, availCC: 0, dailyCap: 0 },
+};
+const hourlyData = [];
+const tfnDailyData = window._tfnData = [];
+const cpcTrendData = {};
+/* JARVIS_DATA_END */
+
+// ── Render ─────────────────────────────────────────────────────────────────
+
+document.getElementById('sync-time').textContent =
+  __JARVIS_SYNC__.lastSynced !== 'never' ? __JARVIS_SYNC__.lastSynced.replace('T', ' ').slice(0, 16) : 'never';
+document.getElementById('cdr-date').textContent = __JARVIS_SYNC__.cdrDate || '—';
+
+function pct(a, b) { return b > 0 ? Math.round(a / b * 100) : 0; }
+
+function renderRG(key, g, cls) {
+  const label = key === 'normal' ? 'iOS Normal' : key === 'premium' ? 'iOS Premium' : 'Total';
+  const capPct = pct(g.activeCC, g.dailyCap);
+  return `
+    <div class="rg-card ${cls}">
+      <h2>${label}</h2>
+      <div class="stat-row"><span class="stat-label">Buyers</span><span class="stat-val">${g.buyers}</span></div>
+      <div class="stat-row"><span class="stat-label">Active</span><span class="stat-val green">${g.active}</span></div>
+      <div class="stat-row"><span class="stat-label">Live CC</span><span class="stat-val blue">${g.liveCC}</span></div>
+      <div class="stat-row"><span class="stat-label">Avail CC</span><span class="stat-val">${g.availCC}</span></div>
+      <div class="stat-row"><span class="stat-label">Active CC</span><span class="stat-val">${g.activeCC} / ${g.totalCC}</span></div>
+      <div class="stat-row">
+        <span class="stat-label">Daily Cap</span>
+        <span class="stat-val ${capPct >= 90 ? 'yellow' : ''}">${g.activeCC} / ${g.dailyCap} <small style="color:#666">(${capPct}%)</small></span>
+      </div>
+    </div>`;
+}
+
+document.getElementById('rg-grid').innerHTML =
+  renderRG('normal', ringGroups.normal, '') +
+  renderRG('premium', ringGroups.premium, '') +
+  renderRG('total', ringGroups.total, 'total');
+
+// TFN table
+const tfn = tfnDailyData.length ? tfnDailyData : (window._tfnData || []);
+if (tfn.length > 0) {
+  const rows = tfn.map(r => {
+    const delta = r.delta || 0;
+    const cls = delta > 0 ? 'delta-pos' : delta < 0 ? 'delta-neg' : 'delta-neu';
+    const sign = delta > 0 ? '+' : '';
+    const ar = typeof r.answerRate === 'number' ? (r.answerRate * 100).toFixed(1) + '%' : (r.answerRate || '—');
+    return `<tr>
+      <td>${r.tfn || r.id}</td>
+      <td><span class="pill">${r.id}</span></td>
+      <td>${r.unique ?? r.today ?? 0}</td>
+      <td>${r.today ?? 0}</td>
+      <td>${r.yesterday ?? 0}</td>
+      <td class="${cls}">${sign}${delta}</td>
+      <td>$${(r.cpc || 0).toFixed(2)}</td>
+      <td>${ar}</td>
+      <td style="color:#666">${r.talkTime || '—'}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('tfn-wrap').innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>TFN</th><th>Buyer</th><th>Unique</th><th>Today</th>
+          <th>Yesterday</th><th>Δ</th><th>CPC</th><th>Ans%</th><th>Talk Time</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+</script>
+</body>
+</html>
