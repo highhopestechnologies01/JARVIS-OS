@@ -3,16 +3,23 @@ JARVIS Telegram Bot — command handler using long-polling.
 Runs as an APScheduler job every 10 seconds.
 
 Commands:
+  /menu     — interactive button menu
   /status   — infrastructure health summary
   /briefing — today's executive briefing
   /memory   — last 5 memory entries
+  /ads      — Meta Ads live summary
+  /ads YYYY-MM-DD — Meta Ads for a specific date
+  /pause <campaign>    — pause campaign via CDP
+  /activate <campaign> — activate campaign via CDP
   /rdp      — RDP machine statuses
+  /calls    — last 6 VAPI call records
   /help     — list commands
   <text>    — ask Claude Haiku anything
 """
 
 import structlog
 import httpx
+from datetime import datetime, timezone as tz, timedelta
 
 from src.config import settings
 
@@ -22,29 +29,96 @@ TELEGRAM_API = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
 
 # Track last processed update_id to avoid reprocessing
 _last_update_id: int = 0
+_commands_registered: bool = False
 
 
-async def _send(chat_id: str | int, text: str, parse_mode: str = "HTML") -> None:
-    """Send a message back to the user."""
+# ── Core send helpers ─────────────────────────────────────────────────────────
+
+async def _send(
+    chat_id: str | int,
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: dict | None = None,
+) -> None:
+    """Send a message, optionally with inline keyboard."""
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(f"{TELEGRAM_API}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-            })
+            await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
     except Exception as e:
         log.error("telegram_bot.send.failed", error=str(e))
 
 
+async def _answer_callback(callback_id: str, text: str = "") -> None:
+    """Acknowledge a callback query (removes the loading spinner on the button)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
+                "callback_query_id": callback_id,
+                "text": text,
+            })
+    except Exception:
+        pass
+
+
+def _inline_kb(*rows: list[tuple[str, str]]) -> dict:
+    """
+    Build an inline keyboard reply_markup.
+    Each row is a list of (label, callback_data) tuples.
+    Example: _inline_kb([("Today", "ads:today"), ("Yesterday", "ads:yesterday")])
+    """
+    return {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": data} for label, data in row]
+            for row in rows
+        ]
+    }
+
+
+# ── Register bot commands with Telegram (shown when user types "/") ───────────
+
+async def _register_commands() -> None:
+    """Register slash commands with BotFather so Telegram shows a command menu."""
+    global _commands_registered
+    if _commands_registered:
+        return
+    commands = [
+        {"command": "menu",     "description": "Interactive button menu"},
+        {"command": "status",   "description": "Infrastructure health"},
+        {"command": "ads",      "description": "Meta Ads live summary (or /ads YYYY-MM-DD)"},
+        {"command": "briefing", "description": "Today's executive briefing"},
+        {"command": "calls",    "description": "Last 6 VAPI call records"},
+        {"command": "rdp",      "description": "RDP machine statuses"},
+        {"command": "memory",   "description": "Last 5 memory entries"},
+        {"command": "workflows","description": "Recent n8n automation activity"},
+        {"command": "intel",    "description": "AI pattern insights"},
+        {"command": "help",     "description": "All commands"},
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(f"{TELEGRAM_API}/setMyCommands", json={"commands": commands})
+        _commands_registered = True
+        log.info("telegram_bot.commands_registered")
+    except Exception as e:
+        log.warning("telegram_bot.register_commands.failed", error=str(e))
+
+
+# ── Poll updates ──────────────────────────────────────────────────────────────
+
 async def _get_updates(offset: int = 0) -> list[dict]:
-    """Long-poll for new messages."""
+    """Long-poll for new messages and callback queries."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(f"{TELEGRAM_API}/getUpdates", params={
                 "offset": offset,
                 "timeout": 5,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             })
             data = resp.json()
             return data.get("result", [])
@@ -53,9 +127,22 @@ async def _get_updates(offset: int = 0) -> list[dict]:
         return []
 
 
+# ── Command handlers ──────────────────────────────────────────────────────────
+
+async def _handle_menu(chat_id: int) -> None:
+    """Send interactive button menu."""
+    kb = _inline_kb(
+        [("📊 Ads Live", "ads:live"),    ("📅 Ads Yesterday", "ads:yesterday")],
+        [("🖥 Status",   "cmd:status"),  ("📋 Briefing",      "cmd:briefing")],
+        [("📞 Calls",    "cmd:calls"),   ("⚙️ Workflows",     "cmd:workflows")],
+        [("🧠 Memory",   "cmd:memory"),  ("💡 Intel",         "cmd:intel")],
+        [("🖥 RDP",      "cmd:rdp"),     ("❓ Help",          "cmd:help")],
+    )
+    await _send(chat_id, "<b>🤖 JARVIS Menu</b>\nChoose an action:", reply_markup=kb)
+
+
 async def _handle_status(chat_id: int) -> None:
     """Return live infrastructure health."""
-    import httpx as _httpx
     services = {
         "hermes":     "http://localhost:8000/api/v1/health/ready",
         "n8n":        "http://jarvis-n8n:5677/healthz",
@@ -63,7 +150,7 @@ async def _handle_status(chat_id: int) -> None:
         "prometheus": "http://jarvis-prometheus:9090/-/healthy",
     }
     lines = ["<b>🖥 JARVIS Infrastructure Status</b>\n"]
-    async with _httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=5.0) as client:
         for name, url in services.items():
             try:
                 r = await client.get(url)
@@ -72,7 +159,6 @@ async def _handle_status(chat_id: int) -> None:
                 icon = "❌"
             lines.append(f"{icon} {name}")
 
-    # RDP
     from src.integrations.rdp import check_all_rdp_hosts
     rdp_results = await check_all_rdp_hosts()
     lines.append("")
@@ -81,11 +167,11 @@ async def _handle_status(chat_id: int) -> None:
         lat = f" {rdp['latency_ms']}ms" if rdp["online"] else ""
         lines.append(f"{icon} {rdp['name']} ({rdp['ip']}){lat}")
 
-    await _send(chat_id, "\n".join(lines))
+    kb = _inline_kb([("🔄 Refresh", "cmd:status"), ("🏠 Menu", "cmd:menu")])
+    await _send(chat_id, "\n".join(lines), reply_markup=kb)
 
 
 async def _handle_briefing(chat_id: int) -> None:
-    """Return today's briefing from DB, or generate one."""
     from src.db.connection import AsyncSessionLocal
     from src.db.models import Briefing
     from sqlalchemy import select
@@ -109,20 +195,18 @@ async def _handle_briefing(chat_id: int) -> None:
     else:
         text = "No briefing for today yet. Use the dashboard Scheduler panel to trigger one manually."
 
-    await _send(chat_id, text)
+    kb = _inline_kb([("🔄 Refresh", "cmd:briefing"), ("🏠 Menu", "cmd:menu")])
+    await _send(chat_id, text, reply_markup=kb)
 
 
 async def _handle_memory(chat_id: int) -> None:
-    """Return last 5 memory entries."""
     from src.db.connection import AsyncSessionLocal
     from src.db.models import Memory
     from sqlalchemy import select
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(Memory)
-            .order_by(Memory.created_at.desc())
-            .limit(5)
+            select(Memory).order_by(Memory.created_at.desc()).limit(5)
         )
         memories = result.scalars().all()
 
@@ -134,11 +218,11 @@ async def _handle_memory(chat_id: int) -> None:
     for m in memories:
         lines.append(f"<b>{m.topic}</b> [{m.type}]\n{m.content[:200]}\n")
 
-    await _send(chat_id, "\n".join(lines))
+    kb = _inline_kb([("🏠 Menu", "cmd:menu")])
+    await _send(chat_id, "\n".join(lines), reply_markup=kb)
 
 
 async def _handle_rdp(chat_id: int) -> None:
-    """Return RDP machine statuses."""
     from src.integrations.rdp import check_all_rdp_hosts
     results = await check_all_rdp_hosts()
     lines = ["<b>🖥 RDP Machines</b>\n"]
@@ -147,7 +231,30 @@ async def _handle_rdp(chat_id: int) -> None:
         lat = f" • {r['latency_ms']}ms" if r["online"] else f" • {r.get('error', 'offline')}"
         lines.append(f"{icon} <b>{r['name']}</b> — {r['ip']}\n   {r['username']}{lat}")
     lines.append("\nTunnel: localhost:13389 / localhost:23389")
-    await _send(chat_id, "\n".join(lines))
+
+    kb = _inline_kb(
+        [("🔄 Refresh", "cmd:rdp"), ("📊 Live Ads", "ads:live")],
+        [("🏠 Menu", "cmd:menu")],
+    )
+    await _send(chat_id, "\n".join(lines), reply_markup=kb)
+
+
+def _ads_date_keyboard(current_date: str | None = None) -> dict:
+    """Build date navigation buttons for Ads."""
+    today = datetime.now(tz.utc).date()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    two_days = (today - timedelta(days=2)).isoformat()
+    return _inline_kb(
+        [
+            ("📊 Live", "ads:live"),
+            ("📅 Today", f"ads:{today.isoformat()}"),
+            ("📅 Yesterday", f"ads:{yesterday}"),
+        ],
+        [
+            ("⏪ 2 Days Ago", f"ads:{two_days}"),
+            ("🏠 Menu", "cmd:menu"),
+        ],
+    )
 
 
 async def _handle_ads(chat_id: int, date_arg: str | None = None) -> None:
@@ -164,15 +271,16 @@ async def _handle_ads(chat_id: int, date_arg: str | None = None) -> None:
         await _send(chat_id, f"❌ Failed to fetch ads data: {e}")
         return
 
+    kb = _ads_date_keyboard(date_arg)
+
     if data.get("stale") or data.get("profiles_count", 0) == 0:
         msg = f"⚠️ <b>No Meta Ads data</b> for {date_arg or 'last 2 hours'}."
-        await _send(chat_id, msg)
+        await _send(chat_id, msg, reply_markup=kb)
         return
 
     title = f"📊 <b>Meta Ads — {date_arg or 'Live'}</b>"
     lines = [
-        title,
-        "",
+        title, "",
         f"💰 Total Spend: <b>${data['total_spend']:,.2f}</b>",
         f"▶️ Active Campaigns: <b>{data['active_campaigns']}</b>",
         f"👁 Impressions: <b>{data['total_impressions']:,}</b>",
@@ -199,7 +307,6 @@ async def _handle_ads(chat_id: int, date_arg: str | None = None) -> None:
 
     updated = data.get("last_updated", "")
     if updated:
-        from datetime import datetime, timezone as tz
         try:
             dt = datetime.fromisoformat(updated)
             diff = int((datetime.now(tz.utc) - dt).total_seconds())
@@ -208,7 +315,7 @@ async def _handle_ads(chat_id: int, date_arg: str | None = None) -> None:
         except Exception:
             pass
 
-    await _send(chat_id, "\n".join(lines))
+    await _send(chat_id, "\n".join(lines), reply_markup=kb)
 
 
 async def _handle_campaign_toggle(chat_id: int, action: str, campaign_name: str) -> None:
@@ -220,11 +327,9 @@ async def _handle_campaign_toggle(chat_id: int, action: str, campaign_name: str)
 
     await _send(chat_id, f"🔍 Searching for campaign <b>{campaign_name}</b>...")
 
-    # Find campaign in recent snapshots (last 24h)
     from src.db.connection import AsyncSessionLocal
     from src.db.models import MetaAdsSnapshot
     from sqlalchemy import select, desc
-    from datetime import datetime, timezone as tz, timedelta
 
     cutoff = datetime.now(tz.utc) - timedelta(hours=24)
     async with AsyncSessionLocal() as db:
@@ -235,7 +340,6 @@ async def _handle_campaign_toggle(chat_id: int, action: str, campaign_name: str)
         )
         snapshots = result.scalars().all()
 
-    # Find all profiles containing this campaign (case-insensitive)
     matches: list[dict] = []
     seen_profiles: set[str] = set()
     for snap in snapshots:
@@ -254,10 +358,13 @@ async def _handle_campaign_toggle(chat_id: int, action: str, campaign_name: str)
                 break
 
     if not matches:
-        await _send(chat_id, f"❌ No campaign found matching <b>{campaign_name}</b> in last 24h data.")
+        await _send(
+            chat_id,
+            f"❌ No campaign found matching <b>{campaign_name}</b> in last 24h data.",
+            reply_markup=_inline_kb([("📊 Live Ads", "ads:live"), ("🏠 Menu", "cmd:menu")]),
+        )
         return
 
-    # Queue commands for all matching profiles
     action_word = "activate" if action == "ACTIVATE" else "pause"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -276,16 +383,17 @@ async def _handle_campaign_toggle(chat_id: int, action: str, campaign_name: str)
         return
 
     profiles_str = ", ".join(f"{m['profile_name']} ({m['rdp_host']})" for m in matches)
+    kb = _inline_kb([("📊 Live Ads", "ads:live"), ("🏠 Menu", "cmd:menu")])
     await _send(
         chat_id,
         f"⏳ Queued: <b>{action_word}</b> '<b>{matches[0]['campaign_name']}</b>'\n"
         f"Profiles: {profiles_str}\n\n"
-        f"<i>Will execute on next scraper run (~5 min). You'll get a confirmation when done.</i>"
+        f"<i>Will execute on next scraper run (~5 min). You'll get a confirmation when done.</i>",
+        reply_markup=kb,
     )
 
 
 async def _handle_workflows(chat_id: int) -> None:
-    """Show recent n8n workflow activity stored in Hermes memory."""
     from src.db.connection import AsyncSessionLocal
     from src.db.models import Memory
     from sqlalchemy import select
@@ -309,11 +417,11 @@ async def _handle_workflows(chat_id: int) -> None:
         preview = m.content[:180].replace("\n", " ")
         lines.append(f"<b>{m.topic or m.type}</b> [{ts}]\n{preview}\n")
 
-    await _send(chat_id, "\n".join(lines))
+    kb = _inline_kb([("🔄 Refresh", "cmd:workflows"), ("🏠 Menu", "cmd:menu")])
+    await _send(chat_id, "\n".join(lines), reply_markup=kb)
 
 
 async def _handle_intel(chat_id: int) -> None:
-    """Show recent AI pattern insights."""
     from src.db.connection import AsyncSessionLocal
     from src.db.models import Memory
     from sqlalchemy import select, or_
@@ -336,7 +444,8 @@ async def _handle_intel(chat_id: int) -> None:
         ts = m.created_at.strftime("%m/%d") if m.created_at else "?"
         lines.append(f"[{ts}] {m.content[:300]}\n")
 
-    await _send(chat_id, "\n".join(lines))
+    kb = _inline_kb([("🔄 Refresh", "cmd:intel"), ("🏠 Menu", "cmd:menu")])
+    await _send(chat_id, "\n".join(lines), reply_markup=kb)
 
 
 _RUN_JOBS = {
@@ -350,7 +459,6 @@ _RUN_JOBS = {
 
 
 async def _handle_run(chat_id: int, arg: str) -> None:
-    """Manually trigger a Hermes scheduler job by short name or ID."""
     job_id = _RUN_JOBS.get(arg.lower(), arg.lower())
     valid = ", ".join(sorted(_RUN_JOBS.keys()))
 
@@ -374,7 +482,6 @@ async def _handle_run(chat_id: int, arg: str) -> None:
 
 
 async def _handle_calls(chat_id: int) -> None:
-    """Return last 6 VAPI call events from memory."""
     from src.db.connection import AsyncSessionLocal
     from src.db.models import Memory
     from sqlalchemy import select, or_
@@ -400,19 +507,19 @@ async def _handle_calls(chat_id: int) -> None:
         ts = c.created_at.strftime("%m/%d %H:%M") if c.created_at else "?"
         type_icon = {
             "call_transcript": "📞",
-            "call_transfer": "🔀",
-            "call_status": "📲",
-            "vapi_event": "🔧",
-            "vapi_tool_call": "🛠",
+            "call_transfer":   "🔀",
+            "call_status":     "📲",
+            "vapi_event":      "🔧",
+            "vapi_tool_call":  "🛠",
         }.get(c.type, "📋")
         preview = c.content[:150].replace("\n", " ")
         lines.append(f"{type_icon} <b>{c.type}</b> [{ts}]\n{preview}\n")
 
-    await _send(chat_id, "\n".join(lines))
+    kb = _inline_kb([("🔄 Refresh", "cmd:calls"), ("🏠 Menu", "cmd:menu")])
+    await _send(chat_id, "\n".join(lines), reply_markup=kb)
 
 
 async def _handle_ai(chat_id: int, text: str) -> None:
-    """Pass free-text to JARVIS AI (Groq via ai_client, Anthropic fallback)."""
     from src.core.ai_client import ai_client
     await _send(chat_id, "🤔 Thinking...")
     try:
@@ -432,6 +539,7 @@ async def _handle_ai(chat_id: int, text: str) -> None:
 
 HELP_TEXT = """<b>🤖 JARVIS Commands</b>
 
+/menu — interactive button menu ← <b>start here</b>
 /status — infrastructure health
 /briefing — today's executive briefing
 /memory — last 5 memory entries
@@ -449,9 +557,43 @@ HELP_TEXT = """<b>🤖 JARVIS Commands</b>
 Or just type anything to ask JARVIS (Groq/Anthropic AI)."""
 
 
+# ── Callback query dispatcher ─────────────────────────────────────────────────
+
+async def _handle_callback(chat_id: int, callback_id: str, data: str) -> None:
+    """Handle inline button presses."""
+    await _answer_callback(callback_id)
+
+    if data == "cmd:menu":
+        await _handle_menu(chat_id)
+    elif data == "cmd:status":
+        await _handle_status(chat_id)
+    elif data == "cmd:briefing":
+        await _handle_briefing(chat_id)
+    elif data == "cmd:memory":
+        await _handle_memory(chat_id)
+    elif data == "cmd:rdp":
+        await _handle_rdp(chat_id)
+    elif data == "cmd:calls":
+        await _handle_calls(chat_id)
+    elif data == "cmd:workflows":
+        await _handle_workflows(chat_id)
+    elif data == "cmd:intel":
+        await _handle_intel(chat_id)
+    elif data == "cmd:help":
+        await _send(chat_id, HELP_TEXT)
+    elif data.startswith("ads:"):
+        date_part = data[4:]
+        date_arg = None if date_part == "live" else date_part
+        await _handle_ads(chat_id, date_arg)
+    else:
+        await _send(chat_id, f"❓ Unknown action: {data}")
+
+
+# ── Main poll loop ────────────────────────────────────────────────────────────
+
 async def process_updates() -> None:
     """
-    Poll Telegram for new messages and dispatch commands.
+    Poll Telegram for new messages and callback queries.
     Called by APScheduler every 10 seconds.
     """
     global _last_update_id
@@ -459,11 +601,32 @@ async def process_updates() -> None:
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
         return
 
+    # Register commands once on first run
+    await _register_commands()
+
     updates = await _get_updates(offset=_last_update_id + 1)
 
     for update in updates:
         _last_update_id = update["update_id"]
 
+        # ── Inline button press ──────────────────────────────────────────────
+        if "callback_query" in update:
+            cq = update["callback_query"]
+            chat_id = cq.get("message", {}).get("chat", {}).get("id")
+            callback_id = cq.get("id", "")
+            data = cq.get("data", "")
+
+            if not chat_id:
+                continue
+            if str(chat_id) != str(settings.telegram_chat_id):
+                await _answer_callback(callback_id, "Unauthorized")
+                continue
+
+            log.info("telegram_bot.callback", data=data)
+            await _handle_callback(chat_id, callback_id, data)
+            continue
+
+        # ── Text message ─────────────────────────────────────────────────────
         message = update.get("message", {})
         chat_id = message.get("chat", {}).get("id")
         text = message.get("text", "").strip()
@@ -471,7 +634,6 @@ async def process_updates() -> None:
         if not chat_id or not text:
             continue
 
-        # Security: only respond to the configured chat
         if str(chat_id) != str(settings.telegram_chat_id):
             log.warning("telegram_bot.unauthorized", chat_id=chat_id)
             continue
@@ -480,7 +642,9 @@ async def process_updates() -> None:
 
         cmd = text.lower().split()[0] if text else ""
 
-        if cmd == "/status":
+        if cmd in ("/menu", "/start"):
+            await _handle_menu(chat_id)
+        elif cmd == "/status":
             await _handle_status(chat_id)
         elif cmd == "/briefing":
             await _handle_briefing(chat_id)
@@ -511,7 +675,7 @@ async def process_updates() -> None:
             await _handle_campaign_toggle(chat_id, "ACTIVATE", campaign_arg)
         elif cmd == "/calls":
             await _handle_calls(chat_id)
-        elif cmd in ("/help", "/start"):
+        elif cmd == "/help":
             await _send(chat_id, HELP_TEXT)
         else:
             await _handle_ai(chat_id, text)
